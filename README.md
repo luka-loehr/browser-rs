@@ -15,6 +15,20 @@ accessibility-tree snapshot mode, no multi-tab, dialog handling, file upload, ne
 interception, or drag/drop. It's additive: run it alongside Playwright's MCP, not instead of
 it, unless you've confirmed it covers what you actually use.
 
+## Headless by default, same lifecycle model as `@playwright/mcp`
+
+The window is created hidden (`with_visible(false)`) — WKWebView renders, and every tool
+(`navigate`, `click`, `eval_js`, `screenshot`, ...) works identically whether or not its window
+is on screen. Nothing pops up on the user's screen unless something explicitly calls
+`open_window()`.
+
+The server process's lifecycle is tied **only** to its MCP stdio connection, not to the
+window: closing the window — by the user clicking its close button, or by calling
+`close_window()` — just hides it. The process keeps running, state intact, until its MCP
+client disconnects (same model `@playwright/mcp` uses: the browser is a resource the server
+manages, not the server itself). Earlier versions got this backwards and exited the whole
+process when the window closed.
+
 ## Tools
 
 - `navigate(url)` — load a URL
@@ -26,6 +40,9 @@ it, unless you've confirmed it covers what you actually use.
 - `resize(width, height)` — resize the window (logical/CSS pixels)
 - `reset_size()` — back to the default 1280×800
 - `zoom(scale)` — native zoom (1.0 = 100%), actual rendering scale, not a CSS transform
+- `open_window()` / `close_window()` — show or hide the window so a human can watch (or stop
+  watching). Purely visual, does not affect the server or any page state.
+- `window_status()` — `{"visible": true|false}`
 - `get_text()` — `document.body.innerText`
 - `get_html()` — `document.documentElement.outerHTML`
 - `eval_js(code)` — evaluate arbitrary JavaScript in the page, return its value
@@ -42,10 +59,10 @@ it, unless you've confirmed it covers what you actually use.
 
 ## How it's built
 
-A visible native window (`tao`) owns the process's main thread — `WKWebView` requires a real
-window; it can't run fully headless the way this version is structured. The MCP stdio server
-runs on a background thread with its own `tokio` runtime, and sends commands to the window's
-event loop over a channel (`click`/`type`/`scroll`/`get_text`/`get_html` are all implemented as
+A `tao` window (hidden by default) owns the process's main thread — `WKWebView` still needs a
+real window object to attach to, it just doesn't need to be visible. The MCP stdio server runs
+on a background thread with its own `tokio` runtime, and sends commands to the window's event
+loop over a channel (`click`/`type`/`scroll`/`get_text`/`get_html` are all implemented as
 small, purpose-built JS snippets run through the same `eval_js` path; `screenshot` and `zoom`
 call native WKWebView/wry APIs directly).
 
@@ -56,4 +73,5 @@ cargo build --release -p browser-mcp-rs
 ./target/release/browser-mcp-rs
 ```
 
-A window titled "browser-mcp-rs" opens and stays open for the life of the server.
+Runs headless — nothing appears on screen until something calls `open_window()`. The process
+stays alive until its MCP connection closes, regardless of window state.

@@ -3,6 +3,14 @@
 //! and the actual WebView; the MCP stdio server runs on a background thread and sends it
 //! commands over a channel, since a webview must live on the platform's UI thread.
 //!
+//! **Headless by default.** The window is created hidden (`with_visible(false)`) — WKWebView
+//! renders and can be navigated/evaluated/screenshotted whether or not its window is on screen.
+//! Call `open_window()`/`close_window()` to show or hide it; neither affects the server process.
+//! The process's lifecycle is tied only to its MCP stdio connection (same model as
+//! `@playwright/mcp`): closing the window — by the user clicking its close button, or via
+//! `close_window()` — just hides it, it does not exit the process. The server only exits when
+//! its client disconnects (stdin EOF).
+//!
 //! macOS only for now — Windows (WebView2) / Linux (WebKitGTK) would need their own code paths
 //! behind wry's cross-platform API, not implemented here yet.
 
@@ -36,6 +44,9 @@ enum UserEvent {
     Resize(f64, f64, oneshot::Sender<JsResult>),
     ResetSize(oneshot::Sender<JsResult>),
     Zoom(f64, oneshot::Sender<JsResult>),
+    OpenWindow(oneshot::Sender<JsResult>),
+    CloseWindow(oneshot::Sender<JsResult>),
+    WindowStatus(oneshot::Sender<JsResult>),
 }
 
 #[derive(Clone)]
@@ -63,6 +74,18 @@ impl BrowserHandle {
 
     async fn zoom(&self, scale: f64) -> JsResult {
         self.roundtrip(|tx| UserEvent::Zoom(scale, tx)).await
+    }
+
+    async fn open_window(&self) -> JsResult {
+        self.roundtrip(UserEvent::OpenWindow).await
+    }
+
+    async fn close_window(&self) -> JsResult {
+        self.roundtrip(UserEvent::CloseWindow).await
+    }
+
+    async fn window_status(&self) -> JsResult {
+        self.roundtrip(UserEvent::WindowStatus).await
     }
 
     async fn screenshot(&self) -> Result<Vec<u8>, String> {
@@ -238,6 +261,28 @@ impl BrowserServer {
         self.browser.zoom(p.scale).await.map_err(to_mcp_err)
     }
 
+    #[tool(
+        description = "Show the browser window on screen, for when a human should watch the session. \
+Purely visual — the browser runs headless by default and every other tool works identically whether the \
+window is open or closed. Does not affect the server process."
+    )]
+    async fn open_window(&self) -> Result<String, McpError> {
+        self.browser.open_window().await.map_err(to_mcp_err)
+    }
+
+    #[tool(
+        description = "Hide the browser window (back to headless). The server and the page state keep \
+running exactly as before — this only affects whether a human can see it, same as open_window()."
+    )]
+    async fn close_window(&self) -> Result<String, McpError> {
+        self.browser.close_window().await.map_err(to_mcp_err)
+    }
+
+    #[tool(description = "Check whether the browser window is currently shown on screen or hidden (headless)")]
+    async fn window_status(&self) -> Result<String, McpError> {
+        self.browser.window_status().await.map_err(to_mcp_err)
+    }
+
     #[tool(description = "Take a PNG screenshot of the current browser view (the visible viewport, native WKWebView snapshot) and return it as an image")]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
         let png = self.browser.screenshot().await.map_err(to_mcp_err)?;
@@ -268,9 +313,12 @@ impl ServerHandler for BrowserServer {
             .with_server_info(Implementation::new("browser-mcp-rs", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Browser automation backed by the OS-native webview (WKWebView on macOS) instead of a \
-                 bundled Chromium binary. Navigate, click (by selector or exact coordinates), type, scroll, \
-                 zoom, resize/reset the window, read text/HTML, run arbitrary JS, capture console logs, and \
-                 take real PNG screenshots. macOS only for now.",
+                 bundled Chromium binary. Runs headless by default — navigate, click, type, scroll, zoom, \
+                 read text/HTML, run arbitrary JS, capture console logs, and take real PNG screenshots all \
+                 work with no window ever shown. Call open_window() only if a human should watch; \
+                 close_window() hides it again. Neither affects this server process, which stays alive \
+                 until its MCP connection closes — same lifecycle model as @playwright/mcp. macOS only \
+                 for now.",
             )
     }
 }
@@ -342,9 +390,12 @@ fn main() -> anyhow::Result<()> {
     let proxy = event_loop.create_proxy();
     let console: ConsoleLog = Arc::new(Mutex::new(Vec::new()));
 
+    // Hidden by default: WKWebView renders and can be navigated/evaluated/screenshotted whether
+    // or not its host window is on screen. open_window()/close_window() just toggle visibility.
     let window = WindowBuilder::new()
         .with_title("browser-mcp-rs")
         .with_inner_size(tao::dpi::LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT))
+        .with_visible(false)
         .build(&event_loop)?;
 
     let ipc_console = console.clone();
@@ -382,7 +433,10 @@ fn main() -> anyhow::Result<()> {
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                *control_flow = ControlFlow::Exit;
+                // The user clicking the window's close button hides it, same as close_window() —
+                // it must NOT end the process. The server only exits on MCP stdin EOF (see the
+                // background thread below), matching @playwright/mcp's lifecycle model.
+                window.set_visible(false);
             }
             Event::UserEvent(UserEvent::Navigate(url, tx)) => {
                 let result = webview.load_url(&url).map(|_| "ok".to_string()).map_err(|e| e.to_string());
@@ -418,6 +472,18 @@ fn main() -> anyhow::Result<()> {
             Event::UserEvent(UserEvent::Zoom(scale, tx)) => {
                 let result = webview.zoom(scale).map(|_| format!("zoom set to {scale}")).map_err(|e| e.to_string());
                 let _ = tx.send(result);
+            }
+            Event::UserEvent(UserEvent::OpenWindow(tx)) => {
+                window.set_visible(true);
+                let _ = tx.send(Ok("window shown".to_string()));
+            }
+            Event::UserEvent(UserEvent::CloseWindow(tx)) => {
+                window.set_visible(false);
+                let _ = tx.send(Ok("window hidden".to_string()));
+            }
+            Event::UserEvent(UserEvent::WindowStatus(tx)) => {
+                let visible = window.is_visible();
+                let _ = tx.send(Ok(format!("{{\"visible\":{visible}}}")));
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Screenshot(tx)) => {

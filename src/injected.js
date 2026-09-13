@@ -246,24 +246,25 @@
 
   const yamlStr = s => /^[\w .,:;!?()'@#%&+\-\/…]*$/.test(s) && !/^[-?:,\[\]{}#&*!|>'"%@`]/.test(s) && !s.endsWith(':') ? s : JSON.stringify(s);
 
-  function render(nodes, indent, lines) {
+  // A child whose name repeats its parent's (option "X" > link "X") is printed without the name.
+  function render(nodes, indent, lines, parentName = '') {
     for (const n of nodes) {
       const pad = '  '.repeat(indent);
       if (typeof n === 'string') { lines.push(`${pad}- text: ${yamlStr(n)}`); continue; }
       let head = `${pad}- ${n.role}`;
-      if (n.name) head += ' ' + JSON.stringify(n.name);
+      if (n.name && n.name !== parentName) head += ' ' + JSON.stringify(n.name);
       for (const p of n.props) head += ` [${p}]`;
       head += ` [ref=${n.ref}]`;
       const inlineText = n.children.length === 1 && typeof n.children[0] === 'string' && !n.url ? n.children[0] : null;
       if (n.value) {
         lines.push(`${head}: ${yamlStr(n.value)}`);
-        if (n.children.length && !inlineText) render(n.children, indent + 1, lines);
+        if (n.children.length && !inlineText) render(n.children, indent + 1, lines, n.name);
       } else if (inlineText !== null) {
         lines.push(`${head}: ${yamlStr(inlineText)}`);
       } else if (n.children.length || n.url) {
         lines.push(head + ':');
         if (n.url) lines.push(`${pad}  - /url: ${yamlStr(n.url)}`);
-        render(n.children, indent + 1, lines);
+        render(n.children, indent + 1, lines, n.name);
       } else {
         lines.push(head);
       }
@@ -316,22 +317,29 @@
     if (target.startsWith('text=')) {
       const want = target.slice(5).replace(/^"(.*)"$/, '$1').toLowerCase();
       let best = null;
+      let bestVisible = null;
       for (const el of allElements(document)) {
         if (hiddenForAria(el) || !collapse(el.textContent).toLowerCase().includes(want)) continue;
         best = el; // keep descending: the deepest match is the most specific element
+        if (isVisible(el)) bestVisible = el;
       }
       if (!best) throw new Error(`No element with text "${want}"`);
-      return best;
+      return bestVisible || best;
     }
     if (target.startsWith('role=')) {
       const { role, name, exact } = parseRoleSelector(target.slice(5));
+      // Rank: exact name before substring, visible before hidden ("Search" must beat a hidden "Search the site").
+      const candidates = [];
       for (const el of allElements(document)) {
         if (roleOf(el) !== role || hiddenForAria(el)) continue;
-        if (name === undefined) return el;
+        if (name === undefined) { candidates.push([0, el]); continue; }
         const n = nameOf(el, role);
-        if (exact ? n === name : n.toLowerCase().includes(name.toLowerCase())) return el;
+        const exactHit = n === name || n.toLowerCase() === name.toLowerCase();
+        if (exact ? n === name : (exactHit || n.toLowerCase().includes(name.toLowerCase()))) candidates.push([exactHit ? 0 : 1, el]);
       }
-      throw new Error(`No element matching "${target}"`);
+      if (!candidates.length) throw new Error(`No element matching "${target}"`);
+      candidates.sort((a, b) => (a[0] - b[0]) || (Number(isVisible(b[1])) - Number(isVisible(a[1]))));
+      return candidates[0][1];
     }
     if (target.startsWith('href=')) {
       const want = target.slice(5);
@@ -467,16 +475,49 @@
     });
   }
 
+  // Opens what hides an element when that is page-native and harmless: closed <details>, and collapsed
+  // MediaWiki boxes (navboxes) through their own toggle.
+  function reveal(el) {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+      if (n.tagName === 'DETAILS' && !n.open) n.open = true;
+      if (n.classList && n.classList.contains('mw-collapsed')) {
+        const toggle = n.querySelector('.mw-collapsible-toggle, .mw-collapsible-text');
+        if (toggle) toggle.click();
+      }
+    }
+  }
+
+  // Why an element cannot be seen, naming the container responsible; '' when no container hides it.
+  function hiddenContainer(el) {
+    for (let n = el.parentElement; n && n.nodeType === 1; n = n.parentElement) {
+      if (n.tagName === 'DETAILS' && !n.open) return `inside a closed ${describe(n)}`;
+      const s = getComputedStyle(n);
+      if (s.display === 'none') return `inside ${describe(n)}, which is display:none (collapsed or hidden)`;
+      if (s.visibility === 'hidden') return `inside ${describe(n)}, which is visibility:hidden`;
+    }
+    return getComputedStyle(el).display === 'none' ? 'the element itself is display:none' : '';
+  }
+
   // Waits until the element is attached, visible, stable, enabled (when required) and actually
   // receives pointer events at its center; returns top-level viewport coordinates for the click.
   async function prepare(el, { timeout = 5000, enabled = true, hitTest = true, force = false } = {}) {
-    const deadline = performance.now() + timeout;
+    const started = performance.now();
+    const deadline = started + timeout;
     let reason = '';
     let lastRect = null;
     for (let attempt = 0; ; attempt++) {
       if (!el.isConnected) throw new Error('Element is not attached to the DOM');
       reason = '';
-      if (!force && !isVisible(el)) reason = 'element is not visible';
+      if (!force && !isVisible(el)) {
+        reason = 'element is not visible';
+        if (attempt === 0) reveal(el);
+        // Hidden by a container that is not animating open: say so after a second instead of
+        // waiting out the whole timeout.
+        const hiddenBy = hiddenContainer(el);
+        if (hiddenBy && performance.now() - started > 1000 && !isAnimating(el)) {
+          throw new Error(`${describe(el)} is not visible: ${hiddenBy}. Open or expand that container first, or target a visible copy of the element`);
+        }
+      }
       else if (!force && enabled && (isDisabled(el) || el.getAttribute('aria-disabled') === 'true')) reason = 'element is disabled';
       else if (!force && isAnimating(el)) reason = 'element is animating';
       if (!reason) {
@@ -624,11 +665,13 @@
 
   const NAV_CLASSES = new Set(['navbox', 'vertical-navbox', 'sidebar', 'navbar', 'menu', 'toc', 'breadcrumb', 'breadcrumbs']);
 
-  // Which part of the page an element lives in, so agents can tell content links from chrome.
+  // Which part of the page an element lives in, so agents can tell content links from chrome. The
+  // landmark decides: a navbox inside the article is still "main" (boxOf names the box itself).
   function regionOf(el) {
+    let inNavBox = false;
     for (let n = el; n && n.nodeType === 1; n = n.parentElement || (n.getRootNode && n.getRootNode().host)) {
       const cls = attrOf(n, 'class').split(/\s+/);
-      if (cls.some(c => NAV_CLASSES.has(c.toLowerCase()))) return 'nav';
+      if (cls.some(c => NAV_CLASSES.has(c.toLowerCase()))) inNavBox = true;
       switch (roleOf(n)) {
         case 'main': case 'article': return 'main';
         case 'navigation': return 'nav';
@@ -638,7 +681,15 @@
         case 'dialog': return 'dialog';
       }
     }
-    return 'page';
+    return inNavBox ? 'nav' : 'page';
+  }
+
+  function boxOf(el) {
+    for (let n = el.parentElement; n && n.nodeType === 1; n = n.parentElement) {
+      const c = attrOf(n, 'class').split(/\s+/).find(c => NAV_CLASSES.has(c.toLowerCase()) || c === 'infobox' || c === 'mw-collapsible');
+      if (c) return c;
+    }
+    return '';
   }
 
   function links(opts = {}) {
@@ -646,7 +697,7 @@
     const re = opts.filter ? new RegExp(opts.filter, 'i') : null;
     const limit = opts.limit || 200;
     const out = [];
-    const seen = new Set();
+    const seen = new Map();
     for (const a of root.querySelectorAll('a[href], area[href]')) {
       if (out.length >= limit) break;
       const href = a.href;
@@ -661,9 +712,14 @@
       const region = regionOf(a);
       if (opts.region && region !== opts.region) continue;
       const key = href + '\n' + text;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ ref: refFor(a), region, text, href, raw: a.getAttribute('href'), visible });
+      if (seen.has(key)) {
+        // The same link twice (e.g. once in a collapsed box, once in the text): keep the clickable copy.
+        const i = seen.get(key);
+        if (!out[i].visible && visible) out[i] = { ...out[i], ref: refFor(a), region, box: boxOf(a), visible: true, hidden: '' };
+        continue;
+      }
+      seen.set(key, out.length);
+      out.push({ ref: refFor(a), region, box: boxOf(a), text, href, raw: a.getAttribute('href'), visible, hidden: visible ? '' : (hiddenContainer(a) || 'not visible') });
     }
     return out;
   }
@@ -743,7 +799,7 @@
         else if (t === 'BLOCKQUOTE') out.push('\n> ' + collapse(inline(c)));
         else if (t === 'HR') out.push('\n---');
         else if (t === 'IMG') continue;
-        else if (t === 'IFRAME') {
+        else if (t === 'IFRAME' || t === 'FRAME') {
           // Same-origin frames are part of what a reader sees; cross-origin ones cannot be read.
           try { const d = c.contentDocument; if (d && d.body) block({ childNodes: [d.body] }, depth); } catch {}
         }
@@ -876,17 +932,59 @@
     return out.join('\n\n');
   }
 
+  // Code blocks as a reader sees them: visible ones only (hidden "try it" editors are skipped), with
+  // their line breaks.
+  function codeBlocks(target) {
+    const all = resolveAll(target);
+    const visible = all.filter(isVisible);
+    return (visible.length ? visible : all).map(el => el.innerText);
+  }
+
+  // The page's own search box, if one is visible.
+  function searchInput() {
+    const hint = el => `${attrOf(el, 'name')} ${attrOf(el, 'id')} ${attrOf(el, 'placeholder')} ${attrOf(el, 'aria-label')} ${attrOf(el, 'class')}`;
+    const el = [...allElements(document)].find(el => isVisible(el) && (roleOf(el) === 'searchbox' ||
+      (el.tagName === 'INPUT' && /^(search|text|)$/i.test(el.getAttribute('type') || '') && /search|query|^q$|\bq\b|suche/i.test(hint(el)))));
+    return el ? refFor(el) : null;
+  }
+
+  // A visible button or link that opens a search box ("Search", "Search the site").
+  function searchOpener() {
+    const cands = [...allElements(document)].filter(el => ['button', 'link'].includes(roleOf(el)) && isVisible(el) &&
+      /search|suche/i.test(`${nameOf(el, roleOf(el))} ${attrOf(el, 'aria-label')} ${attrOf(el, 'title')}`));
+    const el = cands.find(el => /^search$/i.test(nameOf(el, roleOf(el)))) || cands[0];
+    return el ? refFor(el) : null;
+  }
+
+  // Suggestions shown under a search box without navigating.
+  function searchResults() {
+    return [...allElements(document)].filter(el => roleOf(el) === 'option' && isVisible(el)).slice(0, 15).map(o => {
+      const a = o.matches('a[href]') ? o : o.querySelector('a[href]');
+      return { ref: refFor(a || o), text: nameOf(o, 'option').slice(0, 140), href: a ? a.href : '' };
+    });
+  }
+
+  // fields: "css" text, "css@attr" attribute, with an optional ":number" / ":int" suffix to parse the value.
   function extract(opts) {
     const items = [...document.querySelectorAll(opts.selector)].slice(0, opts.limit || 100);
     return items.map(item => {
       if (!opts.fields) return collapse(item.innerText);
       const o = {};
       for (const [k, spec] of Object.entries(opts.fields)) {
-        const m = String(spec).match(/^(.*?)(?:@([\w:-]+))?$/);
+        let s = String(spec);
+        let type = null;
+        const typed = s.match(/^(.*):(number|int)$/);
+        if (typed) { s = typed[1]; type = typed[2]; }
+        const m = s.match(/^(.*?)(?:@([\w:-]+))?$/);
         const sel = m[1].trim();
         const attr = m[2];
         const node = sel ? item.querySelector(sel) : item;
-        o[k] = !node ? null : attr ? ((attr === 'href' || attr === 'src') && node[attr] ? node[attr] : node.getAttribute(attr)) : collapse(node.innerText ?? node.textContent);
+        let v = !node ? null : attr ? ((attr === 'href' || attr === 'src') && node[attr] ? node[attr] : node.getAttribute(attr)) : collapse(node.innerText ?? node.textContent);
+        if (type && v != null) {
+          const num = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
+          v = Number.isFinite(num) ? (type === 'int' ? Math.trunc(num) : num) : null;
+        }
+        o[k] = v;
       }
       return o;
     });
@@ -1007,5 +1105,6 @@
     snapshot, resolve, describe, prepare, beginFill, focusForTyping, selectOptions, checkedState,
     waitForText, generateLocator, isRoleVisible, highlight, removeHighlight,
     setRecording, roleOf, nameOf, isVisible, pageText, links, text, tableText, extract, waitForSelector, read,
+    codeBlocks, searchInput, searchOpener, searchResults,
   };
 })();

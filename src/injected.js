@@ -385,7 +385,15 @@
       if (deep) return deep;
       throw new Error(`No element matches selector "${target}"`);
     }
-    return all.find(isVisible) || all[0];
+    const visible = all.find(isVisible);
+    if (visible) return visible;
+    // Only hidden copies in the light DOM: a web component may render the visible one in its shadow root.
+    for (const el of allElements(root)) {
+      if (!el.shadowRoot) continue;
+      const hit = [...el.shadowRoot.querySelectorAll(css)].find(isVisible);
+      if (hit) return hit;
+    }
+    return all[0];
   }
 
   function resolveAll(target) {
@@ -950,9 +958,12 @@
 
   // A visible button or link that opens a search box ("Search", "Search the site").
   function searchOpener() {
+    const label = el => `${nameOf(el, roleOf(el))} ${attrOf(el, 'aria-label')} ${attrOf(el, 'title')}`;
+    // "Skip to search" links only move focus; a button is what opens a search dialog.
     const cands = [...allElements(document)].filter(el => ['button', 'link'].includes(roleOf(el)) && isVisible(el) &&
-      /search|suche/i.test(`${nameOf(el, roleOf(el))} ${attrOf(el, 'aria-label')} ${attrOf(el, 'title')}`));
-    const el = cands.find(el => /^search$/i.test(nameOf(el, roleOf(el)))) || cands[0];
+      /search|suche/i.test(label(el)) && !/^\s*skip/i.test(label(el)));
+    const rank = el => (roleOf(el) === 'button' ? 0 : 2) + (/^search$/i.test(nameOf(el, roleOf(el)).trim()) ? 0 : 1);
+    const el = cands.sort((a, b) => rank(a) - rank(b))[0];
     return el ? refFor(el) : null;
   }
 

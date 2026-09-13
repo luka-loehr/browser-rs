@@ -969,15 +969,72 @@ pub struct FetchResult {
     pub json: Option<Value>,
 }
 
-/// The closest Internet Archive capture of `url` that returned HTTP 200, if there is one.
-async fn wayback_snapshot(url: &str) -> Option<String> {
-    let api = reqwest::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url)]).ok()?;
-    let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(api)).await.ok()?.ok()?;
-    let body: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+/// The closest usable Internet Archive capture of `url`, or why there is none (so the reply can say it).
+async fn wayback_snapshot(url: &str) -> std::result::Result<String, String> {
+    let api = reqwest::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url)]).map_err(|_| "invalid URL".to_string())?;
+    let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(api))
+        .await
+        .map_err(|_| "the archive lookup timed out".to_string())?
+        .map_err(|e| format!("the archive lookup failed ({e})"))?;
+    if !resp.status().is_success() {
+        return Err(format!("the archive answered HTTP {}", resp.status().as_u16()));
+    }
+    let body: Value = serde_json::from_str(&resp.text().await.map_err(|e| e.to_string())?).map_err(|_| "the archive lookup returned no JSON".to_string())?;
     let closest = &body["archived_snapshots"]["closest"];
     // A capture that redirected (3xx) still leads to real archived content; errors (4xx/5xx) do not.
     let usable = closest["status"].as_str().is_some_and(|s| s.starts_with('2') || s.starts_with('3'));
-    (closest["available"] == true && usable).then(|| closest["url"].as_str().map(|u| u.replacen("http://", "https://", 1))).flatten()
+    match closest["url"].as_str() {
+        Some(u) if closest["available"] == true && usable => Ok(u.replacen("http://", "https://", 1)),
+        _ => Err("the Internet Archive has no usable capture".to_string()),
+    }
+}
+
+/// X/Twitter shows nothing to headless browsers; fxtwitter's public API returns the post itself.
+async fn tweet_text(url: &str) -> Option<String> {
+    let re = regex::Regex::new(r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/([^/?#]+)/status/(\d+)").ok()?;
+    let c = re.captures(url)?;
+    let api = format!("https://api.fxtwitter.com/{}/status/{}", &c[1], &c[2]);
+    let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(&api)).await.ok()?.ok()?;
+    let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+    let t = &v["tweet"];
+    let text = t["text"].as_str()?;
+    let mut out = format!(
+        "author: {} (@{})\npublished: {}\nurl: {url}\n\n{text}",
+        t["author"]["name"].as_str().unwrap_or_default(),
+        t["author"]["screen_name"].as_str().unwrap_or_default(),
+        t["created_at"].as_str().unwrap_or_default()
+    );
+    if let Some(media) = t["media"]["all"].as_array().filter(|m| !m.is_empty()) {
+        let urls: Vec<&str> = media.iter().filter_map(|m| m["url"].as_str()).collect();
+        out.push_str(&format!("\n\n[{} media attachment(s): {}]", media.len(), urls.join(" ")));
+    }
+    Some(out)
+}
+
+/// Documentation examples show results in trailing comments (`rtf.format(-1, "day"); // "1 day ago"`).
+/// Wrap those expression statements in console.log so running the example prints what they promise.
+pub fn echo_expressions(code: &str) -> String {
+    const STATEMENTS: [&str; 17] = [
+        "const ", "let ", "var ", "function", "class ", "if ", "if(", "for ", "for(", "while", "return", "import", "export", "}", "//", "console.", "throw",
+    ];
+    code.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            if STATEMENTS.iter().any(|s| trimmed.starts_with(s)) {
+                return line.to_string();
+            }
+            if let Some((expr, comment)) = trimmed.split_once("; //") {
+                let e = expr.trim();
+                let assigns = e.contains(" = ") || e.contains("+=") || e.contains("-=") || e.contains("++") || e.contains("--");
+                if !e.is_empty() && !assigns {
+                    return format!("{indent}console.log({e}); //{comment}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn truncate_chars(s: String, max: usize) -> String {
@@ -1150,6 +1207,11 @@ impl Browser {
             let cdp = cdp.clone();
             async move {
                 let started = Instant::now();
+                if function.is_none() {
+                    if let Some(tweet) = tweet_text(&url).await {
+                        return (i, url, max_chars, started.elapsed().as_millis(), Ok((Some(200), tweet, ", read through api.fxtwitter.com".to_string())));
+                    }
+                }
                 let outcome: Result<(Option<i64>, String, String)> = async {
                     let res = cdp.send("Target.createTarget", json!({ "url": "about:blank", "background": true })).await.map_err(|e| anyhow!(e))?;
                     let target = res["targetId"].as_str().unwrap_or_default().to_string();
@@ -1165,13 +1227,15 @@ impl Browser {
                         if archive_fallback && status.is_some_and(|s| s >= 400) {
                             // Ask the Wayback availability API first: navigating blindly to an uncaptured
                             // URL leaves the tab on a "not archived" page, whose text would be returned.
-                            if let Some(snapshot) = wayback_snapshot(&url).await {
-                                if let Ok(s) = self.navigate(&page, &snapshot).await {
-                                    if s.is_some_and(|s| s < 400) {
+                            match wayback_snapshot(&url).await {
+                                Ok(snapshot) => match self.navigate(&page, &snapshot).await {
+                                    Ok(s) if s.is_some_and(|s| s < 400) => {
                                         via = format!(", read from the Internet Archive because the site answered HTTP {}", status.unwrap_or(0));
                                         status = s;
                                     }
-                                }
+                                    _ => via = ", Internet Archive fallback: the archived copy did not load".to_string(),
+                                },
+                                Err(reason) => via = format!(", Internet Archive fallback: {reason}"),
                             }
                         }
                         let body = match function.as_deref() {

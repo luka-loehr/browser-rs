@@ -1,4 +1,4 @@
-//! browser-mcp-rs: a Rust MCP server driving a bundled Chromium over the DevTools Protocol, with
+//! browser-rs: a Rust MCP server driving a bundled Chromium over the DevTools Protocol, with
 //! the @playwright/mcp tool set. Headless by default; switches to a visible window when a human
 //! has to take over (browser_handoff) and back again afterwards.
 
@@ -19,11 +19,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const HELP: &str = "\
-browser-mcp-rs — MCP browser automation on a bundled Chromium
+browser-rs — MCP browser automation on a bundled Chromium
 
 USAGE:
-    browser-mcp-rs [OPTIONS]        run the MCP server on stdio
-    browser-mcp-rs install          download the bundled Chromium and exit
+    browser-rs [OPTIONS]        run the MCP server on stdio
+    browser-rs install          download the bundled Chromium and exit
 
 OPTIONS (same names as @playwright/mcp):
     --headless / --headed           start headless (default) or with a visible window
@@ -51,7 +51,7 @@ OPTIONS (same names as @playwright/mcp):
 fn parse_args() -> Result<Option<Config>> {
     let mut args = std::env::args().skip(1).peekable();
     let mut cfg = Config {
-        executable: std::env::var_os("BROWSER_MCP_EXECUTABLE").map(PathBuf::from),
+        executable: std::env::var_os("BROWSER_RS_EXECUTABLE").map(PathBuf::from),
         headless: true,
         user_data_dir: None,
         isolated: false,
@@ -64,7 +64,7 @@ fn parse_args() -> Result<Option<Config>> {
         init_scripts: Vec::new(),
         allowed_origins: Vec::new(),
         blocked_origins: Vec::new(),
-        output_dir: std::env::temp_dir().join("browser-mcp-rs"),
+        output_dir: std::env::temp_dir().join("browser-rs"),
         timeout_action: Duration::from_millis(5000),
         timeout_navigation: Duration::from_millis(60000),
         timeout_settle: Duration::from_millis(500),
@@ -95,7 +95,7 @@ fn parse_args() -> Result<Option<Config>> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("browser-mcp-rs {} (Chromium {})", env!("CARGO_PKG_VERSION"), install::CHROME_VERSION);
+                println!("browser-rs {} (Chromium {})", env!("CARGO_PKG_VERSION"), install::CHROME_VERSION);
                 return Ok(None);
             }
             "--headless" => cfg.headless = true,

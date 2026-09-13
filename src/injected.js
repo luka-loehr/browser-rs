@@ -589,13 +589,28 @@
     host.setAttribute(HOST_ATTR, 'handoff');
     host.style.cssText = 'all:initial;position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:2147483647';
     const root = host.attachShadow({ mode: 'closed' });
-    root.innerHTML = `<style>
+    // A constructable stylesheet, not a <style> tag: pages with a strict style-src CSP block
+    // inline <style> elements, which left the banner unstyled on such sites.
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(`
+      :host{all:initial}
       .bar{font:14px/1.4 -apple-system,system-ui,sans-serif;display:flex;gap:14px;align-items:center;background:#111;color:#fff;
         padding:12px 14px 12px 18px;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.35);max-width:min(720px,calc(100vw - 40px))}
       .dot{width:9px;height:9px;border-radius:50%;background:#34c759;flex:none;animation:p 1.4s infinite}
       @keyframes p{50%{opacity:.35}}
       button{font:600 14px -apple-system,system-ui,sans-serif;background:#fff;color:#111;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;flex:none}
-    </style><div class="bar"><span class="dot"></span><span class="msg"></span><button>Done — hand back to agent</button></div>`;
+    `);
+    root.adoptedStyleSheets = [sheet];
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const msg = document.createElement('span');
+    msg.className = 'msg';
+    const button = document.createElement('button');
+    button.textContent = 'Done — hand back to agent';
+    bar.append(dot, msg, button);
+    root.append(bar);
     root.querySelector('.msg').textContent = message || 'The agent handed control to you.';
     root.querySelector('button').addEventListener('click', () => {
       host.remove();

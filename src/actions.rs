@@ -6,6 +6,7 @@ use crate::browser::{Browser, PageRef, Route, Video};
 use crate::keys;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -183,7 +184,7 @@ impl Browser {
     }
 
     async fn prepare(&self, page: &PageRef, obj: &str, enabled: bool, hit_test: bool) -> Result<(f64, f64)> {
-        let opts = json!({ "timeout": self.cfg.timeout_action.as_millis() as u64, "enabled": enabled, "hitTest": hit_test });
+        let opts = json!({ "timeout": self.action_timeout().as_millis() as u64, "enabled": enabled, "hitTest": hit_test });
         let v = self.call_on(page, obj, "function(o) { return __bmcp.prepare(this, o); }", vec![opts]).await?;
         Ok((v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0)))
     }
@@ -371,17 +372,20 @@ impl Browser {
                     json!({ "functionDeclaration": decl, "objectId": main_obj, "arguments": [{ "objectId": main_obj }], "returnByValue": true, "awaitPromise": true, "userGesture": true }),
                     self.cfg.timeout_navigation,
                 )
-                .await?
+                .await
+                .map_err(navigation_error)?
             }
             None => {
                 let expr = if is_fn { format!("({f})()") } else { f.to_string() };
                 self.send_page(
                     page,
                     "Runtime.evaluate",
-                    json!({ "expression": expr, "returnByValue": true, "awaitPromise": true, "userGesture": true, "replMode": true }),
+                    // No replMode: with it, a returned Promise came back serialized as {} instead of awaited.
+                    json!({ "expression": expr, "returnByValue": true, "awaitPromise": true, "userGesture": true }),
                     self.cfg.timeout_navigation,
                 )
-                .await?
+                .await
+                .map_err(navigation_error)?
             }
         };
         if let Some(ex) = res.get("exceptionDetails") {
@@ -439,7 +443,7 @@ impl Browser {
         if let Some(t) = time {
             tokio::time::sleep(Duration::from_secs_f64(t.clamp(0.0, 30.0))).await;
         }
-        let timeout = self.cfg.timeout_navigation.as_millis().min(30_000);
+        let timeout = self.wait_timeout().as_millis();
         if let Some(t) = gone {
             self.eval_world(page, &format!("__bmcp.waitForText({}, true, {timeout})", js(t))).await?;
         }
@@ -634,12 +638,16 @@ impl Browser {
         })
     }
 
-    pub fn network_text(&self, page: &PageRef, include_static: bool, filter: Option<&str>) -> Result<String> {
+    pub fn network_text(&self, page: &PageRef, include_static: bool, filter: Option<&str>, failed_only: bool) -> Result<String> {
         let re = filter.map(regex::Regex::new).transpose().context("invalid filter regex")?;
         self.tab_read(page, |t| {
             let mut out = Vec::new();
             for (i, r) in t.requests.iter().enumerate().skip(t.requests_nav_start) {
                 let ok = r.status.is_some_and(|s| s < 400) && r.failure.is_none();
+                let failed = r.failure.is_some() || r.status.is_some_and(|s| s >= 400);
+                if failed_only && !failed {
+                    continue;
+                }
                 let is_static = matches!(r.resource_type.as_str(), "Image" | "Font" | "Stylesheet" | "Script" | "Media" | "Manifest");
                 if is_static && ok && !include_static {
                     continue;
@@ -650,9 +658,10 @@ impl Browser {
                 let status = match (&r.failure, r.status) {
                     (Some(f), _) => format!("[FAILED] {f}"),
                     (None, Some(s)) => format!("[{s}] {}", r.status_text),
-                    _ => "[pending]".into(),
+                    _ => format!("[pending for {} ms]", r.started.map(|s| s.elapsed().as_millis()).unwrap_or(0)),
                 };
-                out.push(format!("{}. [{}] {} => {status}{}", i - t.requests_nav_start + 1, r.method, r.url, if r.from_route { " (mocked)" } else { "" }));
+                let took = r.duration_ms.map(|d| format!(" ({d} ms)")).unwrap_or_default();
+                out.push(format!("{}. [{}] {} => {status}{took}{}", i - t.requests_nav_start + 1, r.method, r.url, if r.from_route { " (mocked)" } else { "" }));
             }
             if out.is_empty() { "No network requests".to_string() } else { out.join("\n") }
         })
@@ -929,6 +938,166 @@ impl Browser {
         Ok(v.as_str().unwrap_or_default().to_string())
     }
 
+}
+
+fn navigation_error(e: anyhow::Error) -> anyhow::Error {
+    let s = e.to_string();
+    if s.contains("Execution context was destroyed") || s.contains("Inspected target navigated") || s.contains("Cannot find context") {
+        anyhow!("the page navigated away while the script was running; run it again on the new page")
+    } else {
+        e
+    }
+}
+
+pub struct FetchResult {
+    /// "HTTP 200 OK · application/json · 6180 chars"
+    pub head: String,
+    pub text: String,
+    /// The parsed body when the response is JSON.
+    pub json: Option<Value>,
+}
+
+pub fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let total = s.chars().count();
+    format!("{}\n… truncated at {max} of {total} chars", s.chars().take(max).collect::<String>())
+}
+
+impl Browser {
+    pub fn action_timeout(&self) -> Duration {
+        self.overrides.lock().unwrap().timeout.unwrap_or(self.cfg.timeout_action)
+    }
+
+    fn wait_timeout(&self) -> Duration {
+        self.overrides.lock().unwrap().timeout.unwrap_or_else(|| self.cfg.timeout_navigation.min(Duration::from_secs(30)))
+    }
+
+    pub async fn wait_selector(&self, page: &PageRef, target: &str, state: &str) -> Result<String> {
+        let ms = self.wait_timeout().as_millis();
+        self.eval_world(page, &format!("__bmcp.waitForSelector({}, {}, {ms})", js(target), js(state))).await?;
+        Ok(format!("{target} is {state}"))
+    }
+
+    pub async fn wait_url(&self, page: &PageRef, pattern: &str) -> Result<String> {
+        let re = glob_to_regex(pattern)?;
+        let deadline = Instant::now() + self.wait_timeout();
+        loop {
+            let url = self.tab_read(page, |t| t.url.clone())?;
+            if re.is_match(&url) {
+                let _ = self.wait_loaded(page, self.cfg.timeout_navigation).await;
+                return Ok(format!("URL is {url}"));
+            }
+            if Instant::now() > deadline {
+                bail!("timed out waiting for a URL matching {pattern} (currently {url})");
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    /// An HTTP request sent by the server itself, carrying the browser's cookies for that URL and its
+    /// user agent. Unlike `fetch` inside the page, it is not limited by CORS or the page's CSP, and page
+    /// scripts that wrap `window.fetch` cannot interfere.
+    pub async fn fetch_in_page(&self, page: &PageRef, url: &str, method: &str, headers: &serde_json::Map<String, Value>, body: Option<&str>) -> Result<FetchResult> {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().expect("http client"));
+
+        let base = self.tab_read(page, |t| t.url.clone())?;
+        let target = reqwest::Url::parse(&base).and_then(|b| b.join(url)).or_else(|_| reqwest::Url::parse(url)).with_context(|| format!("invalid URL {url}"))?;
+        self.check_origin(target.as_str())?;
+        let cookies = self.send_page(page, "Network.getCookies", json!({ "urls": [target.as_str()] }), self.cfg.timeout_action).await?;
+        let cookie_header = cookies["cookies"]
+            .as_array()
+            .map(|a| a.iter().map(|c| format!("{}={}", c["name"].as_str().unwrap_or_default(), c["value"].as_str().unwrap_or_default())).collect::<Vec<_>>().join("; "))
+            .unwrap_or_default();
+        let user_agent = match &self.cfg.user_agent {
+            Some(ua) => ua.clone(),
+            None => page.cdp.send("Browser.getVersion", json!({})).await.ok().and_then(|v| v["userAgent"].as_str().map(|s| s.replace("HeadlessChrome", "Chrome"))).unwrap_or_default(),
+        };
+
+        let method = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).context("invalid HTTP method")?;
+        let mut req = client.request(method, target.clone()).header("User-Agent", user_agent);
+        if base.starts_with("http") {
+            req = req.header("Referer", &base);
+        }
+        if !cookie_header.is_empty() {
+            req = req.header("Cookie", cookie_header);
+        }
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+        }
+        if let Some(b) = body {
+            req = req.body(b.to_string());
+        }
+        let resp = tokio::time::timeout(self.cfg.timeout_navigation, req.send()).await.map_err(|_| anyhow!("request to {target} timed out"))??;
+        let status = resp.status();
+        let final_url = resp.url().to_string();
+        let kind = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        let bytes = resp.bytes().await?;
+        let Ok(text) = std::str::from_utf8(&bytes).map(str::to_string) else {
+            let head = format!("HTTP {status} · {kind} · {} bytes of binary data (not shown)", bytes.len());
+            return Ok(FetchResult { head, text: String::new(), json: None });
+        };
+        let json = if kind.contains("json") { serde_json::from_str::<Value>(&text).ok() } else { None };
+        let mut head = format!("HTTP {status} · {} · {} chars", if kind.is_empty() { "no content type" } else { &kind }, text.chars().count());
+        if final_url != target.as_str() {
+            head.push_str(&format!(" · final URL {final_url}"));
+        }
+        Ok(FetchResult { head, text, json })
+    }
+
+    /// Loads URLs in parallel background tabs and reads each; the current tab is left alone.
+    /// `targets` are (url, function, max_chars) triples, so each page can be read its own way.
+    pub async fn scrape(&self, targets: &[(String, Option<String>, usize)], concurrency: usize, lead: Option<u32>, page_timeout: Duration) -> Result<String> {
+        let cdp = self.cdp().await?;
+        let jobs = targets.iter().cloned().enumerate().map(|(i, (url, function, max_chars))| {
+            let cdp = cdp.clone();
+            async move {
+                let started = Instant::now();
+                let outcome: Result<(Option<i64>, String)> = async {
+                    let res = cdp.send("Target.createTarget", json!({ "url": "about:blank", "background": true })).await.map_err(|e| anyhow!(e))?;
+                    let target = res["targetId"].as_str().unwrap_or_default().to_string();
+                    // One slow site must not hold up the whole call.
+                    let read = tokio::time::timeout(page_timeout, async {
+                        self.wait_tab_ready(&target).await?;
+                        let session = self.state.lock().unwrap().tabs.iter().find(|t| t.target_id == target).map(|t| t.session_id.clone()).ok_or_else(|| anyhow!("the tab closed"))?;
+                        let page = PageRef { cdp: cdp.clone(), session, target_id: target.clone() };
+                        let status = self.navigate(&page, &url).await?;
+                        let body = match function.as_deref() {
+                            Some(f) => match self.evaluate(&page, f, None).await? {
+                                Value::String(s) => s,
+                                v => v.to_string(),
+                            },
+                            None => self.eval_world(&page, &format!("__bmcp.text({})", json!({ "maxChars": max_chars, "lead": lead }))).await?.as_str().unwrap_or_default().to_string(),
+                        };
+                        Ok::<_, anyhow::Error>((status, body))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timed out after {} ms (pageTimeout)", page_timeout.as_millis())));
+                    let _ = cdp.send("Target.closeTarget", json!({ "targetId": target })).await;
+                    read
+                }
+                .await;
+                (i, url, max_chars, started.elapsed().as_millis(), outcome)
+            }
+        });
+        let mut results: Vec<_> = futures_util::stream::iter(jobs).buffer_unordered(concurrency.clamp(1, 8)).collect().await;
+        results.sort_by_key(|r| r.0);
+        Ok(results
+            .into_iter()
+            .map(|(i, url, max_chars, ms, r)| match r {
+                Ok((status, body)) => format!(
+                    "## {}. {url} (HTTP {}, {ms} ms)\n{}",
+                    i + 1,
+                    status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                    truncate_chars(body, max_chars)
+                ),
+                Err(e) => format!("## {}. {url} (failed after {ms} ms)\n{e:#}", i + 1),
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"))
+    }
 }
 
 /// Playwright URL glob: `**` any characters, `*` any characters except `/`, `?` one character,

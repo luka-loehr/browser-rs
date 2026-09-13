@@ -13,6 +13,8 @@ pub struct Reply {
     pub snapshot: bool,
     pub page_state: bool,
     pub error: bool,
+    /// Lower cap for a full snapshot in this reply (e.g. after a failed batch step).
+    pub snapshot_max: Option<usize>,
 }
 
 impl Reply {
@@ -184,6 +186,7 @@ impl Browser {
                                         (_, 0) => Self::ACTION_SNAPSHOT_CHARS,
                                         (_, n) => n.min(Self::ACTION_SNAPSHOT_CHARS),
                                     };
+                                    let max = reply.snapshot_max.map_or(max, |m| m.min(max));
                                     format!("### Snapshot\n{}\n", self.snapshot_block_capped(&snap, max))
                                 }
                             });

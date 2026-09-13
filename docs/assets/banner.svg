@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="browser-rs — the browser your agent would pick">
+  <defs>
+    <radialGradient id="glow" cx="78%" cy="30%" r="60%">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity="0.45"/>
+      <stop offset="0.55" stop-color="#2b1f66" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="window" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1b20"/>
+      <stop offset="1" stop-color="#0e0e12"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.04" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="320" fill="#050507"/>
+  <rect width="1280" height="320" fill="url(#grid)"/>
+  <rect width="1280" height="320" fill="url(#glow)"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <text x="72" y="92" fill="#8f8fa3" font-size="15" letter-spacing="4">BROWSER AUTOMATION FOR AI AGENTS · RUST</text>
+    <text x="68" y="178" fill="#f4f4f6" font-size="78" font-family="ui-sans-serif, -apple-system, Helvetica, Arial, sans-serif" font-weight="600" letter-spacing="-2">browser-rs</text>
+    <text x="72" y="222" fill="#c9c9d4" font-size="20" font-family="ui-sans-serif, -apple-system, Helvetica, Arial, sans-serif">The browser your agent would pick.</text>
+    <text x="72" y="276" fill="#6f6f80" font-size="13" letter-spacing="2.5">535 MB vs 1,496 MB · 3–6 MS READY · 79 TOOLS · IN-PLACE HAND-OFF</text>
+  </g>
+
+  <g transform="translate(812 56)">
+    <rect width="400" height="208" rx="12" fill="url(#window)" stroke="#2a2a33"/>
+    <circle cx="22" cy="20" r="5" fill="#ff5f57"/>
+    <circle cx="40" cy="20" r="5" fill="#febc2e"/>
+    <circle cx="58" cy="20" r="5" fill="#28c840"/>
+    <rect x="84" y="12" width="296" height="16" rx="8" fill="#15151a" stroke="#26262e"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">
+      <text x="22" y="62" fill="#7c5cff">browser_batch</text>
+      <text x="126" y="62" fill="#8f8fa3">{ snapshot: "none" }</text>
+      <text x="22" y="86" fill="#c9c9d4">1. navigate  → HTTP 200</text>
+      <text x="22" y="106" fill="#c9c9d4">2. type      #user-name</text>
+      <text x="22" y="126" fill="#c9c9d4">3. click     link=^Checkout$</text>
+      <text x="22" y="146" fill="#c9c9d4">4. wait_for  url **/complete*</text>
+      <text x="22" y="166" fill="#c9c9d4">5. read      .title equals "Done"</text>
+      <text x="22" y="192" fill="#28c840">elapsed_ms: 1057</text>
+    </g>
+  </g>
+</svg>

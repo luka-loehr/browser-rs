@@ -1,8 +1,14 @@
 [package]
-name = "browser-mcp-rs"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+name = "browser-rs"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Browser automation for AI agents: a small Rust MCP server driving a bundled Chromium, with Playwright MCP's tools plus agent-first reading, batching and an in-place human hand-off."
+repository = "https://github.com/luka-loehr/browser-rs"
+homepage = "https://browser-rs.lukaloehr.com"
+readme = "README.md"
+keywords = ["mcp", "browser", "automation", "chromium", "agents"]
+categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
 rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
@@ -18,3 +24,8 @@ regex = "1"
 similar = "2"
 libc = "0.2"
 tokio-tungstenite = "0.29"
+
+# Small, fast binary: thin LTO and stripped symbols.
+[profile.release]
+lto = "thin"
+strip = true

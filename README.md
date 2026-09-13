@@ -32,7 +32,8 @@ Website: [browser-rs.lukaloehr.com](https://browser-rs.lukaloehr.com)
   CORS), trimming JSON to the `fields` you ask for or running a `transform`. `browser_scrape` reads
   many URLs at once in background tabs.
 - **In-place human hand-off.** `browser_handoff` opens a live view of the running page in a tab of
-  your own browser. You click, type, paste and answer dialogs; nothing restarts or reloads.
+  your own browser. You click, type, paste and answer dialogs; nothing restarts or reloads. Measured
+  over the viewer's own connection: input to visible change p50 16 ms, 60 fps while animating.
 - **Measured, not guessed.** Every reply ends with `elapsed_ms`; `BROWSER_RS_TRACE=<file>` logs each
   call with its duration and reply size.
 
@@ -49,6 +50,7 @@ and the tools it wished it had. Their requests became the code between rounds.
 | 1 | 5 · 8 · 7 · 7 · 5 · 5 | 0 of 6 | 3 of 6 | $4.57 |
 | 2 | 7 · 8 · 7 · 8 · 7 · 8 | 0 of 6 | 6 of 6 | $2.71 |
 | 3 | 8 · 8 · 7 · 8 · 8 · 7 | 4 of 6 | 6 of 6 | $2.67 |
+| 4 | 8 · 8 · 7 · 9 · 8 · 8 | 2 of 6 | 6 of 6 | $1.67 |
 
 The Wikipedia race went from 75,000 characters of tool replies and 7.6 s of browser time to 3,400
 characters and 0.9 s. The harness lives outside this repo; the tasks and prompts are described in

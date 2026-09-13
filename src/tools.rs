@@ -642,7 +642,7 @@ pub struct TableParams {
 pub struct ExtractParams {
     /// CSS selector matching each item, e.g. ".inventory_item"
     selector: String,
-    /// Field name -> sub-selector inside the item: "css" for text, "css@attr" or "@attr" for an attribute (href/src are absolute). Omit for each item's text
+    /// Field name -> sub-selector inside the item: "css" for text, "css@attr" or "@attr" for an attribute (href/src are absolute); add ":number" or ":int" to parse, e.g. {"name": ".inventory_item_name", "price": ".inventory_item_price:number"}. Omit for each item's text
     fields: Option<std::collections::BTreeMap<String, String>>,
     /// Max items (default 100)
     limit: Option<usize>,
@@ -725,8 +725,27 @@ pub struct RunSnippetParams {
     /// Or run a code block from the page: a selector such as "pre" or "pre code"
     #[serde(alias = "ref")]
     target: Option<String>,
-    /// Which matching code block to run (default 0, the first)
+    /// Which visible matching code block to run (default 0, the first)
     index: Option<usize>,
+    /// Log expression statements whose result is shown in a trailing comment (doc style `x.f(); // "result"`). Default true for page code blocks
+    echo: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchParams {
+    /// What to search for on the current site
+    query: String,
+    /// Press Enter after typing (default true); false returns the live suggestions instead
+    submit: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckParams {
+    /// Checkbox, radio or switch: ref or selector
+    #[serde(alias = "ref")]
+    target: String,
+    /// true to check (default), false to uncheck; nothing happens if it already is
+    checked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -885,6 +904,8 @@ impl BrowserServer {
             "browser_read" => self.read(p(args)?).await,
             "browser_scroll_until" => self.scroll_until(p(args)?).await,
             "browser_run_snippet" => self.run_snippet(p(args)?).await,
+            "browser_search" => self.search(p(args)?).await,
+            "browser_check" => self.check(p(args)?).await,
             "browser_text" => self.text(p(args)?).await,
             "browser_table" => self.table(p(args)?).await,
             "browser_extract" => self.extract(p(args)?).await,
@@ -1174,8 +1195,9 @@ impl BrowserServer {
                         let href = l["href"].as_str().unwrap_or_default();
                         let href = href.strip_prefix(&origin).filter(|h| h.starts_with('/')).unwrap_or(href);
                         let text: String = l["text"].as_str().unwrap_or_default().chars().take(80).collect();
-                        let hidden = if l["visible"] == false { " (hidden)" } else { "" };
-                        format!("{} [{}] {text}{hidden} -> {href}", l["ref"].as_str().unwrap_or_default(), l["region"].as_str().unwrap_or_default())
+                        let hidden = if l["visible"] == false { format!(" (hidden: {})", l["hidden"].as_str().unwrap_or("not visible")) } else { String::new() };
+                        let boxed = l["box"].as_str().filter(|b| !b.is_empty()).map(|b| format!(" <{b}>")).unwrap_or_default();
+                        format!("{} [{}]{boxed} {text}{hidden} -> {href}", l["ref"].as_str().unwrap_or_default(), l["region"].as_str().unwrap_or_default())
                     })
                     .collect()
             })
@@ -1310,22 +1332,77 @@ impl BrowserServer {
 
     async fn run_snippet(&self, p: RunSnippetParams) -> Result<Reply> {
         let page = self.browser.page().await?;
-        let code = match (&p.code, &p.target) {
-            (Some(code), _) => code.clone(),
+        let (code, label) = match (&p.code, &p.target) {
+            (Some(code), _) => (code.clone(), None),
             (None, Some(target)) => {
-                // innerText keeps the code's line breaks (a collapsed line would turn the rest into a comment).
-                let blocks = self.browser.eval_world(&page, &format!("__bmcp.read({}, 'innerText', true)", crate::actions::js(target))).await?;
+                // Visible blocks only, with their line breaks (a collapsed line would turn the rest into a comment).
+                let blocks = self.browser.eval_world(&page, &format!("__bmcp.codeBlocks({})", crate::actions::js(target))).await?;
                 let index = p.index.unwrap_or(0);
                 let blocks = blocks.as_array().cloned().unwrap_or_default();
-                blocks
+                let code = blocks
                     .get(index)
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .ok_or_else(|| anyhow!("{target} has {} code block(s); index {index} does not exist", blocks.len()))?
+                    .ok_or_else(|| anyhow!("{target} has {} visible code block(s); index {index} does not exist", blocks.len()))?;
+                let first: String = code.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().chars().take(90).collect();
+                let label = format!("Ran visible code block {index} of {} ({target}), starting: {first}", blocks.len());
+                (code, Some(label))
             }
             (None, None) => bail!("pass code, or target to run a code block from the page"),
         };
-        Ok(Reply::text(self.browser.run_snippet(&page, &code).await?))
+        let echo = p.echo.unwrap_or(p.code.is_none());
+        let code = if echo { crate::actions::echo_expressions(&code) } else { code };
+        let output = self.browser.run_snippet(&page, &code).await?;
+        Ok(Reply::text(match label {
+            Some(label) => format!("{label}\n{output}"),
+            None => output,
+        }))
+    }
+
+    async fn search(&self, p: SearchParams) -> Result<Reply> {
+        let page = self.browser.page().await?;
+        let before = self.browser.tab_read(&page, |t| t.url.clone())?;
+        let mut input = self.browser.eval_world(&page, "__bmcp.searchInput()").await?;
+        if input.is_null() {
+            // Many sites hide the box behind a "Search" button.
+            let opener = self.browser.eval_world(&page, "__bmcp.searchOpener()").await?;
+            let Some(opener) = opener.as_str() else { bail!("no search box or search button found on {before}") };
+            self.browser.click(&page, opener, false, "left", &[]).await?;
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                input = self.browser.eval_world(&page, "__bmcp.searchInput()").await?;
+                if !input.is_null() {
+                    break;
+                }
+            }
+        }
+        let Some(target) = input.as_str().map(str::to_string) else { bail!("clicked the search button, but no search box appeared") };
+        self.browser.fill(&page, &target, &p.query).await?;
+        if p.submit.unwrap_or(true) {
+            self.browser.settle(&page, self.browser.press(&page, "Enter")).await?;
+        } else {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        let after = self.browser.tab_read(&page, |t| t.url.clone())?;
+        let (heading, items) = if after != before {
+            let links = self.browser.eval_world(&page, "__bmcp.links({ region: 'main', limit: 20 })").await?;
+            (format!("Searched for \"{}\": results at {after}", p.query), links)
+        } else {
+            let options = self.browser.eval_world(&page, "__bmcp.searchResults()").await?;
+            (format!("Searched for \"{}\": suggestions on {after} (the page did not navigate)", p.query), options)
+        };
+        let lines: Vec<String> = items
+            .as_array()
+            .map(|a| a.iter().map(|l| format!("{} {} -> {}", l["ref"].as_str().unwrap_or_default(), l["text"].as_str().unwrap_or_default(), l["href"].as_str().unwrap_or_default())).collect())
+            .unwrap_or_default();
+        Ok(Reply::raw(if lines.is_empty() { format!("{heading}\n(no result links found; take a snapshot to look)") } else { format!("{heading}\n{}", lines.join("\n")) }))
+    }
+
+    async fn check(&self, p: CheckParams) -> Result<Reply> {
+        let page = self.browser.page().await?;
+        let want = p.checked.unwrap_or(true);
+        self.browser.settle(&page, self.browser.set_checked(&page, &p.target, want)).await?;
+        Ok(Reply::action(format!("{} is {}", p.target, if want { "checked" } else { "unchecked" })))
     }
 
     async fn read(&self, p: ReadParams) -> Result<Reply> {
@@ -1572,7 +1649,17 @@ impl BrowserServer {
         self.respond(self.scroll_until(p).await).await
     }
 
-    #[tool(description = "Run JavaScript in the page and get what it logs plus its return value, or run a code block from the page itself (target \"pre\", index) exactly as written, e.g. a documentation example")]
+    #[tool(description = "Search the current site with its own search box: finds the box (opening a hidden one behind a Search button), types the query, submits, and returns the result links, or the live suggestions if the page does not navigate")]
+    async fn browser_search(&self, Parameters(p): Parameters<SearchParams>) -> R {
+        self.respond(self.search(p).await).await
+    }
+
+    #[tool(description = "Set a checkbox, radio or switch to checked or unchecked with a real click; does nothing if it already is")]
+    async fn browser_check(&self, Parameters(p): Parameters<CheckParams>) -> R {
+        self.respond(self.check(p).await).await
+    }
+
+    #[tool(description = "Run JavaScript in the page and get what it logs plus its return value, or run a visible code block from the page itself (target \"pre\", index), e.g. a documentation example; results written in comments are echoed")]
     async fn browser_run_snippet(&self, Parameters(p): Parameters<RunSnippetParams>) -> R {
         self.respond(self.run_snippet(p).await).await
     }
@@ -1582,7 +1669,7 @@ impl BrowserServer {
         self.respond(self.table(p).await).await
     }
 
-    #[tool(description = "Extract repeated items (products, rows, results) as one JSON object per line, mapping fields to sub-selectors")]
+    #[tool(description = "Extract repeated items (products, rows, results) as one JSON object per line, mapping fields to sub-selectors, with typed numbers: {selector: \".inventory_item\", fields: {name: \".inventory_item_name\", price: \".inventory_item_price:number\"}}")]
     async fn browser_extract(&self, Parameters(p): Parameters<ExtractParams>) -> R {
         self.respond(self.extract(p).await).await
     }
@@ -2131,8 +2218,9 @@ impl ServerHandler for BrowserServer {
                  visible match, \"a >> b\" enters iframes and shadow roots), text=…, role=button[name=\"…\"], link=<regex>, \
                  href=<url>; put dependent steps in one browser_batch (each step reports its ms); (3) pass snapshot:\"none\" on \
                  actions you do not need to see (\"main\" = main content, default \"diff\" = changed lines); (4) browser_scrape \
-                 reads many URLs in parallel, browser_scroll_until loads infinite lists, browser_run_snippet runs code and \
-                 captures console output. browser_type replaces a field's value. Every reply ends with elapsed_ms. When a \
+                 reads many URLs in parallel, browser_search uses the site's own search, browser_scroll_until loads \
+                 infinite lists, browser_run_snippet runs code or a page code block and captures its output, browser_check \
+                 sets checkboxes. browser_type replaces a field's value. Every reply ends with elapsed_ms. When a \
                  human must act (log in, 2FA, CAPTCHA, payment), call browser_handoff: a live view of the same page opens in \
                  their browser, nothing reloads.",
             )

@@ -4,10 +4,10 @@ Browser automation for agents: a Rust MCP server that drives a **bundled, pinned
 the Chrome DevTools Protocol, with **`@playwright/mcp`'s tool names and parameters**. No Node, no
 Playwright library, no driver process: one small binary talking to Chromium over two pipes.
 
-- **Headless by default.** When a human has to act (log in, 2FA, a CAPTCHA, payment details),
-  the agent calls `browser_handoff`: the browser reopens in a visible window with a banner, waits
-  until the person clicks **Done**, then goes back to headless. Cookies, localStorage,
-  sessionStorage and open tabs carry over.
+- **Headless, with an in-place hand-off.** When a human has to act (log in, 2FA, a CAPTCHA,
+  payment details), the agent calls `browser_handoff`: a live view of the current tab opens in a
+  window, the person clicks, types and pastes into the running page, then clicks **Done**. Nothing
+  restarts or reloads, so the page keeps its exact state, and no browser appears in the Dock.
 - **Trusted input.** Clicks, typing, keys, drags and drops go through `Input.dispatch*`, so the
   page sees real events (`isTrusted === true`), not JavaScript imitations.
 - **Fewer tokens per step.** After the first snapshot of a page, action replies contain only the
@@ -25,11 +25,12 @@ Two Chrome for Testing builds of the same pinned version (`153.0.8010.36`), down
 | Build | Used for | Download |
 |---|---|---|
 | `chrome-headless-shell` | headless mode (default) | ~99 MB, on the first tool call |
-| `chrome` (full browser) | headed mode and `browser_handoff` | ~191 MB, only the first time a window is needed |
+| `chrome` (full browser) | headed mode (`--headed`, `browser_set_mode`) | ~191 MB, only the first time headed mode is used |
 
 `browser-mcp-rs install` downloads both ahead of time. `--executable-path` (or
 `BROWSER_MCP_EXECUTABLE`) uses your own Chromium or Chrome instead. Chromium starts lazily on the
-first tool call and stops when the MCP connection closes.
+first tool call and stops when the MCP connection closes. A tiny watchdog process next to each
+browser stops it if the server dies abruptly (crash, SIGKILL), so no Chromium is ever left behind.
 
 The profile lives in `<cache>/profile` and persists logins between sessions. If another session
 already holds it, the server falls back to a temporary profile. `--isolated` always uses a
@@ -52,8 +53,8 @@ alias.
 
 | Tool | What it does |
 |---|---|
-| `browser_handoff` | Hand the browser to a human: visible window, banner with your message, waits for **Done** (or a timeout), then back to headless |
-| `browser_set_mode` | Switch between `headless` and `headed` explicitly |
+| `browser_handoff` | Hand the running browser to a human through a live view (click, type, paste, dialogs, tabs) and wait for **Done** or a timeout. Exact page state, no reload |
+| `browser_set_mode` | Switch between `headless` and `headed` explicitly (relaunches Chromium, pages reload) |
 | `browser_batch` | Run several tools in order in one call and get one snapshot at the end |
 
 **Opt-in with `--caps`** (`--caps all` enables everything, 72 tools):
@@ -106,7 +107,8 @@ Same names as `@playwright/mcp` where they exist:
 | `src/install.rs` | Downloads and locates the pinned Chrome for Testing builds |
 | `src/browser.rs` | Launch, per-tab state from CDP events, headless ↔ headed relaunch |
 | `src/actions.rs` | Trusted input, screenshots, PDF, storage, routes, tracing, video, hand-off |
-| `src/injected.js` | Runs in an isolated world of every page: snapshot and refs, actionability checks, the hand-off banner |
+| `src/injected.js` | Runs in an isolated world of every page: snapshot and refs, actionability checks, highlights, recorder |
+| `src/liveview.rs`, `src/liveview.html` | The hand-off viewer: local token-protected server, screencast relay, input forwarding |
 | `src/response.rs` | Reply formatting and snapshot diffs |
 | `src/tools.rs` | The MCP tools |
 
@@ -114,10 +116,17 @@ Before every click, the injected runtime waits until the element is attached, vi
 enabled and actually receives the pointer at its center. If something covers it, the error names
 the covering element.
 
-Chromium cannot switch between headless and headed while running, so a mode switch closes
-Chromium and relaunches it on the same profile. It copies cookies (session cookies too) and
-sessionStorage across and reopens the tabs. **Pages reload, so unsaved in-page state such as a
-half-filled form is lost.**
+**Hand-off.** The headless browser never changes. `browser_handoff` starts a server on 127.0.0.1
+behind a random 128-bit token and opens it as an app window of your own Chrome (or your default
+browser). The window streams the current tab through CDP's screencast and sends mouse, keyboard
+and paste back as trusted input events. JavaScript dialogs appear in the viewer, tabs opened by the
+page are followed, and **Done**, closing the viewer or the timeout returns control to the agent.
+The server shuts down when the hand-off ends.
+
+**Explicit mode switch.** Chromium cannot switch between headless and headed while running, so
+`browser_set_mode` closes Chromium and relaunches it on the same profile. It copies cookies
+(session cookies too) and sessionStorage across and reopens the tabs. **Pages reload, so unsaved
+in-page state is lost**; use `browser_handoff` when state matters.
 
 ## Not implemented
 
@@ -126,6 +135,9 @@ half-filled form is lost.**
 - The `--device`, `--mobile`, `--init-page`, `--save-session`, `--output-max-size` and
   `--config` options.
 - Cross-origin iframes are not part of the snapshot (same-origin iframes are).
+- In the hand-off viewer, native `<select>` dropdowns and date pickers are not drawn by headless
+  Chromium (keyboard selection works), a file chooser cannot be opened, and passkeys do not work
+  (use a one-time code or password instead).
 - `browser_stop_video` needs `ffmpeg` on `PATH` to produce a `.webm`; without it the frames stay
   on disk as JPEGs.
 - Recording (`browser_start_recording`) captures clicks, fills, checks, selections and

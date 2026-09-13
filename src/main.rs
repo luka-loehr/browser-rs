@@ -7,6 +7,7 @@ mod browser;
 mod cdp;
 mod install;
 mod keys;
+mod liveview;
 mod response;
 mod tools;
 
@@ -155,8 +156,38 @@ impl<F: std::future::Future> AwaitBlocking for F {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--watchdog") {
+        watchdog(args.get(2).and_then(|p| p.parse().ok()).unwrap_or(0));
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+}
+
+/// Runs as a separate tiny process next to every Chromium. Its stdin is a pipe held open by the
+/// server; when the server dies for any reason, even SIGKILL, the pipe hits EOF and the watchdog
+/// takes Chromium's whole process group down with it, since Chromium itself keeps running when its
+/// DevTools pipe closes.
+fn watchdog(pgid: i32) {
+    use std::io::Read;
+    if pgid <= 1 {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let mut stdin = std::io::stdin();
+    while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(100));
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            return;
+        }
+    }
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+async fn run() -> Result<()> {
     let Some(cfg) = parse_args()? else { return Ok(()) };
     let browser = Browser::new(cfg);
     let server = tools::BrowserServer::new(browser.clone());

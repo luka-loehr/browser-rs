@@ -491,12 +491,10 @@ pub struct VerifyValueParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffParams {
-    /// What the human should do, shown in a banner in the browser window (e.g. "Log in to GitHub, then click Done")
+    /// What the human should do, shown at the top of the viewer (e.g. "Log in to GitHub, then click Done")
     message: String,
     /// How long to wait for the human, in seconds (default 600)
     timeout_seconds: Option<u64>,
-    /// Go back to headless mode once the human is done, if the browser was headless before (default true)
-    return_to_headless: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1040,12 +1038,12 @@ impl BrowserServer {
     }
 
     #[tool(
-        description = "Hand the browser to the human: switches to a visible window, shows a banner with your message, and waits until they click Done. Use when a person must act: log in, pass 2FA or a CAPTCHA, enter payment or other private details, or approve something. Returns once they are finished, then goes back to headless"
+        description = "Hand the browser to the human in its exact current state: opens a live view of the current tab in a window, where they can click, type and paste, and waits until they click Done. Nothing reloads and the browser stays headless. Use when a person must act: log in, pass 2FA or a CAPTCHA, enter payment or other private details, or approve something"
     )]
     async fn browser_handoff(&self, Parameters(p): Parameters<HandoffParams>) -> R {
         let _g = self.lock.lock().await;
         let timeout = Duration::from_secs(p.timeout_seconds.unwrap_or(600));
-        let r = self.browser.hand_off(&p.message, timeout, p.return_to_headless.unwrap_or(true)).await.map(Reply::action);
+        let r = self.browser.hand_off(&p.message, timeout).await.map(Reply::action);
         self.respond(r).await
     }
 

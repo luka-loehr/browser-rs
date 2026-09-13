@@ -1,0 +1,161 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent hand-off</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0b0c; color: #f2f2f2; font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  header { height: 52px; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #161618; border-bottom: 1px solid #2a2a2d; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #34c759; flex: none; animation: p 1.4s infinite; }
+  .dot.off { background: #ff453a; animation: none; }
+  @keyframes p { 50% { opacity: .35; } }
+  .msg { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 38%; }
+  .url { flex: 1; min-width: 0; background: #0b0b0c; border: 1px solid #2a2a2d; border-radius: 8px; padding: 6px 10px; color: #a1a1a6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, select { font: inherit; color: #f2f2f2; background: #2a2a2d; border: 0; border-radius: 8px; padding: 7px 11px; cursor: pointer; }
+  button:hover, select:hover { background: #3a3a3d; }
+  #done { background: #f2f2f2; color: #111; font-weight: 600; }
+  #done:hover { background: #fff; }
+  main { position: absolute; inset: 52px 0 0 0; display: grid; place-items: center; }
+  canvas { max-width: 100%; max-height: 100%; outline: none; cursor: default; background: #fff; box-shadow: 0 0 0 1px #2a2a2d; }
+  #status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #a1a1a6; }
+</style>
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="msg" id="msg"></span>
+  <button id="back" title="Back">←</button>
+  <button id="reload" title="Reload">↻</button>
+  <span class="url" id="url"></span>
+  <select id="tabs" title="Tabs"></select>
+  <button id="done">Done — hand back to agent</button>
+</header>
+<main>
+  <canvas id="screen" tabindex="0"></canvas>
+  <div id="status">Connecting…</div>
+</main>
+<script>
+  const token = location.pathname.split('/').pop();
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  let meta = null;      // metadata of the frame currently drawn
+  let pendingMeta = null;
+  let finished = false;
+  let ws;
+
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws/${token}`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { document.getElementById('dot').classList.remove('off'); statusEl.textContent = 'Waiting for the first frame…'; };
+    ws.onclose = () => {
+      document.getElementById('dot').classList.add('off');
+      if (finished) { statusEl.textContent = 'Handed back to the agent. You can close this window.'; canvas.style.opacity = .3; return; }
+      statusEl.textContent = 'Disconnected, reconnecting…';
+      setTimeout(connect, 800);
+    };
+    ws.onmessage = async (e) => {
+      if (typeof e.data === 'string') {
+        const m = JSON.parse(e.data);
+        if (m.t === 'frame') pendingMeta = m;
+        else if (m.t === 'info') {
+          document.getElementById('msg').textContent = m.message;
+          document.title = 'Agent hand-off — ' + m.message;
+        } else if (m.t === 'page') {
+          document.getElementById('url').textContent = m.url;
+          const sel = document.getElementById('tabs');
+          sel.innerHTML = '';
+          m.tabs.forEach((title, i) => {
+            const o = document.createElement('option');
+            o.value = i; o.textContent = `${i + 1}: ${title || 'Untitled'}`; o.selected = i === m.current;
+            sel.appendChild(o);
+          });
+          sel.style.display = m.tabs.length > 1 ? '' : 'none';
+        } else if (m.t === 'dialog') {
+          // The page is blocked on a JavaScript dialog the headless browser cannot draw; ask here.
+          setTimeout(() => {
+            if (m.kind === 'prompt') {
+              const text = prompt(m.message, m.default);
+              send({ t: 'dialog', accept: text !== null, text: text ?? undefined });
+            } else if (m.kind === 'alert') {
+              alert(m.message);
+              send({ t: 'dialog', accept: true });
+            } else {
+              send({ t: 'dialog', accept: confirm(m.message) });
+            }
+          }, 0);
+        } else if (m.t === 'finished') {
+          finished = true;
+          ws.close();
+          window.close();
+        }
+        return;
+      }
+      const bmp = await createImageBitmap(new Blob([e.data], { type: 'image/jpeg' }));
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+      meta = pendingMeta;
+      statusEl.textContent = '';
+    };
+  }
+  connect();
+
+  // Canvas pixels -> page CSS pixels, using the frame's own metadata.
+  function point(e) {
+    const r = canvas.getBoundingClientRect();
+    const w = meta ? meta.deviceWidth : canvas.width, h = meta ? meta.deviceHeight : canvas.height;
+    return { x: (e.clientX - r.left) * (w / r.width), y: (e.clientY - r.top) * (h / r.height) };
+  }
+  const mods = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+  const buttonName = b => ['left', 'middle', 'right'][b] || 'none';
+
+  let lastMove = 0;
+  canvas.addEventListener('mousemove', e => {
+    const now = performance.now();
+    if (now - lastMove < 16 && e.buttons === 0) return; // at most ~60 moves/s when just hovering
+    lastMove = now;
+    send({ t: 'mouse', type: 'mouseMoved', ...point(e), button: e.buttons & 1 ? 'left' : 'none', buttons: e.buttons, modifiers: mods(e) });
+  });
+  canvas.addEventListener('mousedown', e => {
+    canvas.focus();
+    send({ t: 'mouse', type: 'mousePressed', ...point(e), button: buttonName(e.button), buttons: e.buttons, clickCount: e.detail || 1, modifiers: mods(e) });
+    e.preventDefault();
+  });
+  window.addEventListener('mouseup', e => {
+    if (e.target !== canvas) return;
+    send({ t: 'mouse', type: 'mouseReleased', ...point(e), button: buttonName(e.button), buttons: e.buttons, clickCount: e.detail || 1, modifiers: mods(e) });
+  });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('wheel', e => {
+    send({ t: 'mouse', type: 'mouseWheel', ...point(e), deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods(e) });
+    e.preventDefault();
+  }, { passive: false });
+
+  // Keys go to the page as real key events; printable characters carry their text.
+  function keyEvent(e, down) {
+    if (e.metaKey && ['r', 'w', 'q', 't', 'n'].includes(e.key.toLowerCase())) return; // leave window shortcuts alone
+    if (down && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') return;     // handled by the paste event
+    const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey;
+    send({
+      t: 'key', type: down ? (printable ? 'keyDown' : 'rawKeyDown') : 'keyUp',
+      key: e.key, code: e.code, keyCode: e.keyCode, text: down && printable ? e.key : (down && e.key === 'Enter' ? '\r' : undefined),
+      modifiers: mods(e), location: e.location, autoRepeat: e.repeat,
+    });
+    e.preventDefault();
+  }
+  canvas.addEventListener('keydown', e => keyEvent(e, true));
+  canvas.addEventListener('keyup', e => keyEvent(e, false));
+  window.addEventListener('paste', e => {
+    const text = e.clipboardData.getData('text/plain');
+    if (text) send({ t: 'text', text });
+    e.preventDefault();
+  });
+
+  document.getElementById('back').onclick = () => send({ t: 'back' });
+  document.getElementById('reload').onclick = () => send({ t: 'reload' });
+  document.getElementById('tabs').onchange = e => send({ t: 'tab', index: Number(e.target.value) });
+  document.getElementById('done').onclick = () => send({ t: 'done' });
+  window.addEventListener('beforeunload', () => send({ t: 'closed' }));
+  canvas.focus();
+</script>

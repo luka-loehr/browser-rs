@@ -145,6 +145,8 @@ pub struct State {
     pub show_actions: Option<u64>,
     /// Session most recently brought to front.
     pub front: Option<String>,
+    /// Receives screencast frames while a human hand-off is running.
+    pub live: Option<crate::liveview::LiveSink>,
 }
 
 impl State {
@@ -156,6 +158,7 @@ impl State {
 struct Running {
     cdp: Arc<Cdp>,
     child: Child,
+    watchdog: Option<Child>,
     headless: bool,
     profile: PathBuf,
     temp_profile: bool,
@@ -342,6 +345,8 @@ impl Browser {
         cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
+                // Own process group, so the watchdog can stop Chromium and all its helpers at once.
+                libc::setpgid(0, 0);
                 if libc::dup2(to_chrome_r, 3) < 0 || libc::dup2(from_chrome_w, 4) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -349,6 +354,17 @@ impl Browser {
             });
         }
         let child = cmd.spawn().with_context(|| format!("launching {}", exe.display()))?;
+        // The watchdog's stdin pipe stays open exactly as long as this server process lives.
+        let watchdog = std::env::current_exe().ok().and_then(|me| {
+            Command::new(me)
+                .arg("--watchdog")
+                .arg(child.id().to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        });
         unsafe {
             libc::close(to_chrome_r);
             libc::close(from_chrome_w);
@@ -406,7 +422,7 @@ impl Browser {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Ok(Running { cdp, child, headless, profile, temp_profile })
+        Ok(Running { cdp, child, watchdog, headless, profile, temp_profile })
     }
 
     /// The persistent profile, unless another live browser holds it (then a throwaway one).
@@ -762,23 +778,6 @@ impl Browser {
         if let Some(s) = session {
             let _ = cdp.send_session(&s, "Page.bringToFront", json!({})).await;
         }
-        // Chromium launched from a background process does not take focus on its own, so ask the app
-        // to activate (no System Events / accessibility permission involved). `activate` launches
-        // the app if it is not running, which once left a stray default-profile browser behind after
-        // a quick headed -> headless switch: only activate a running app, and wait for osascript so
-        // a shutdown can never overlap it.
-        #[cfg(target_os = "macos")]
-        {
-            let script = "if application id \"com.google.chrome.for.testing\" is running then \
-                          tell application id \"com.google.chrome.for.testing\" to activate";
-            let child = tokio::process::Command::new("osascript")
-                .args(["-e", script])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status();
-            let _ = tokio::time::timeout(Duration::from_secs(2), child).await;
-        }
     }
 
     // ------------------------------------------------------------------ storage state
@@ -875,6 +874,10 @@ impl Drop for Browser {
     fn drop(&mut self) {
         if let Ok(mut g) = self.running.try_lock() {
             if let Some(r) = g.as_mut() {
+                if let Some(mut w) = r.watchdog.take() {
+                    let _ = w.kill();
+                    let _ = w.wait();
+                }
                 let _ = r.child.kill();
                 let _ = r.child.wait();
                 if r.temp_profile {
@@ -886,6 +889,11 @@ impl Drop for Browser {
 }
 
 async fn shutdown(r: &mut Running) {
+    // Stop the watchdog first: once Chromium has exited, its process group id could be reused.
+    if let Some(mut w) = r.watchdog.take() {
+        let _ = w.kill();
+        let _ = w.wait();
+    }
     let _ = r.cdp.send_full(None, "Browser.close", json!({}), Duration::from_secs(3)).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1161,6 +1169,9 @@ fn on_event(ev: &Event, state: &Arc<Mutex<State>>, cdp: Option<Arc<Cdp>>, rt: &t
             let ack = p["sessionId"].clone();
             {
                 let mut st = state.lock().unwrap();
+                if let Some(live) = st.live.as_ref().filter(|l| l.session == s) {
+                    live.publish(p);
+                }
                 if let Some(v) = st.video.as_mut().filter(|v| v.session == s) {
                     use base64::Engine as _;
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(p["data"].as_str().unwrap_or_default()) {
@@ -1373,7 +1384,6 @@ async fn init_session(cdp: Arc<Cdp>, state: Arc<Mutex<State>>, session: String, 
         cdp.send_session(s, "Network.enable", json!({ "maxPostDataSize": 65536 })),
         cdp.send_session(s, "Log.enable", json!({})),
         cdp.send_session(s, "Page.addScriptToEvaluateOnNewDocument", json!({ "source": INJECTED, "worldName": WORLD, "runImmediately": true })),
-        cdp.send_session(s, "Runtime.addBinding", json!({ "name": "__bmcpHandoff", "executionContextName": WORLD })),
         cdp.send_session(s, "Runtime.addBinding", json!({ "name": "__bmcpRecord", "executionContextName": WORLD })),
         cdp.send_session(s, "Page.setInterceptFileChooserDialog", json!({ "enabled": true })),
     ];

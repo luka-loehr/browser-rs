@@ -929,64 +929,6 @@ impl Browser {
         Ok(v.as_str().unwrap_or_default().to_string())
     }
 
-    // ------------------------------------------------------------------ human hand-off
-
-    /// Switches to a visible window, shows a banner, and blocks until the human clicks "Done"
-    /// (or closes the window, or the timeout passes). Optionally goes headless again afterwards.
-    pub async fn hand_off(&self, message: &str, timeout: Duration, return_headless: bool) -> Result<String> {
-        let was_headless = self.is_headless().await;
-        self.set_headless(false).await?;
-        let page = self.page().await?;
-        let cdp = page.cdp.clone();
-        let banner = format!("__bmcp.showHandoff({})", js(message));
-
-        let sessions: Vec<String> = self.state.lock().unwrap().tabs.iter().map(|t| t.session_id.clone()).collect();
-        let mut scripts = Vec::new();
-        for s in &sessions {
-            if let Ok(v) = cdp
-                .send_session(s, "Page.addScriptToEvaluateOnNewDocument", json!({ "source": format!("addEventListener('DOMContentLoaded', () => {banner})"), "worldName": crate::browser::WORLD }))
-                .await
-            {
-                scripts.push((s.clone(), v["identifier"].as_str().unwrap_or_default().to_string()));
-            }
-            let p = PageRef { cdp: cdp.clone(), session: s.clone(), target_id: String::new() };
-            let _ = self.eval_world(&p, &banner).await;
-        }
-        // Tabs opened while the human works need the banner too, so poll for them.
-        let done = cdp.wait_for(|e| e.method == "Runtime.bindingCalled" && e.params["name"] == "__bmcpHandoff");
-        let started = Instant::now();
-        tokio::pin!(done);
-        let outcome = loop {
-            tokio::select! {
-                r = &mut done => break if r.is_ok() { "done" } else { "closed" },
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                    if cdp.is_closed() { break "closed"; }
-                    if started.elapsed() > timeout { break "timeout"; }
-                }
-            }
-        };
-
-        if outcome != "closed" {
-            for (s, id) in &scripts {
-                let _ = cdp.send_session(s, "Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": id })).await;
-            }
-            let sessions: Vec<String> = self.state.lock().unwrap().tabs.iter().map(|t| t.session_id.clone()).collect();
-            for s in sessions {
-                let p = PageRef { cdp: cdp.clone(), session: s, target_id: String::new() };
-                let _ = self.eval_world(&p, "__bmcp.hideHandoff()").await;
-            }
-        }
-        let mut msg = match outcome {
-            "done" => "The user finished and handed control back.".to_string(),
-            "timeout" => format!("The user did not click Done within {}s; continuing.", timeout.as_secs()),
-            _ => "The user closed the browser window. Cookies saved to the profile are kept; the browser restarts on the next call.".to_string(),
-        };
-        if outcome != "closed" && return_headless && was_headless {
-            self.set_headless(true).await?;
-            msg.push_str(" Back in headless mode.");
-        }
-        Ok(msg)
-    }
 }
 
 /// Playwright URL glob: `**` any characters, `*` any characters except `/`, `?` one character,

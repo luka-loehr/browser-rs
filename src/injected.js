@@ -524,12 +524,18 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  function notEditable(el) {
+    const readOnlyEditor = el.closest && el.closest('[contenteditable="false"]');
+    return new Error(`${describe(el)} is not editable: it is not an input, a textarea or a contenteditable element` +
+      (readOnlyEditor ? '. It sits inside contenteditable="false", so this is a read-only editor; rich-text editors usually offer their own API (e.g. tinymce.activeEditor.setContent) via browser_evaluate' : ''));
+  }
+
   // Focuses the element and selects its current content so trusted Input.insertText replaces it.
   // Returns "insert" (Rust inserts the text), or "done" when the value was set directly.
   function beginFill(el, value) {
     if (el.tagName === 'LABEL' && el.control) el = el.control;
     const kind = editableKind(el);
-    if (!kind) throw new Error(`${describe(el)} is not an editable element`);
+    if (!kind) throw notEditable(el);
     if (el.readOnly) throw new Error(`${describe(el)} is read-only`);
     el.focus();
     if (kind === 'set' || value === '') {
@@ -551,7 +557,7 @@
 
   function focusForTyping(el) {
     if (el.tagName === 'LABEL' && el.control) el = el.control;
-    if (!editableKind(el)) throw new Error(`${describe(el)} is not an editable element`);
+    if (!editableKind(el)) throw notEditable(el);
     el.focus();
     if (typeof el.setSelectionRange === 'function' && el.value != null) {
       try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
@@ -641,6 +647,9 @@
       if (out.length >= limit) break;
       const href = a.href;
       if (!href || href.startsWith('javascript:')) continue;
+      // internal: same-origin pages only, without in-page anchors and without wiki file/meta pages.
+      if (opts.internal && (a.origin !== location.origin || (a.getAttribute('href') || '').startsWith('#') ||
+          /\/(File|Special|Help|Category|Template|Template_talk|Talk|Portal|Wikipedia):/.test(decodeURIComponent(a.pathname)))) continue;
       const visible = isVisible(a);
       if (opts.visibleOnly !== false && !visible) continue;
       const text = nameOf(a, 'link') || collapse(a.textContent);
@@ -730,6 +739,10 @@
         else if (t === 'BLOCKQUOTE') out.push('\n> ' + collapse(inline(c)));
         else if (t === 'HR') out.push('\n---');
         else if (t === 'IMG') continue;
+        else if (t === 'IFRAME') {
+          // Same-origin frames are part of what a reader sees; cross-origin ones cannot be read.
+          try { const d = c.contentDocument; if (d && d.body) block({ childNodes: [d.body] }, depth); } catch {}
+        }
         else block(c, depth);
       }
     }
@@ -794,12 +807,22 @@
     const head = [];
     if (!opts.target && !opts.heading) {
       head.push(`title: ${document.title}`, `url: ${location.href}`);
-      const byline = [...document.querySelectorAll('[rel=author], [itemprop=author], .byline, .author-name, .author, [class*="byline"], [class*="author"]')]
-        .map(e => collapse(e.textContent))
-        .find(t => t.length >= 3 && t.length <= 80);
+      // Bylines mix in logos, dates and "Published": try the most specific elements first and keep
+      // only a clean, name-like string.
+      const cleanByline = t => collapse(t)
+        .replace(/^(by|von|written by|posted by)\s+/i, '')
+        .replace(/\s*\b(published|updated|posted|on)\b.*$/i, '')
+        .replace(/\s*[|·•,–-]\s*$/, '')
+        .trim();
+      const byline = [...document.querySelectorAll('[itemprop=author] [itemprop=name], [rel=author], a[href*="/author/"], .author-name, .byline a, [itemprop=author], .byline, .author, [class*="byline"], [class*="author"]')]
+        .map(e => cleanByline(e.textContent))
+        .find(t => t.length >= 3 && t.length <= 60 && !/\d{4}/.test(t) && !/\blogo\b/i.test(t));
       const author = metaContent(['author', 'article:author', 'parsely-author', 'dc.creator', 'twitter:creator']) || byline || '';
+      const MONTH = '(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\\.?';
+      const dateInText = new RegExp(`\\b(\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\.? ${MONTH} \\d{4}|${MONTH} \\d{1,2},? \\d{4})\\b`);
       const published = metaContent(['article:published_time', 'datePublished', 'parsely-pub-date', 'date', 'dc.date', 'pubdate']) ||
-        attrOf(document.querySelector('time[datetime]') || document.documentElement, 'datetime');
+        attrOf(document.querySelector('time[datetime]') || document.documentElement, 'datetime') ||
+        ((contentRoot().innerText || '').slice(0, 3000).match(dateInText) || [])[0] || '';
       const description = metaContent(['description', 'og:description']);
       if (author) head.push(`author: ${author}`);
       if (published) head.push(`published: ${published}`);
@@ -811,7 +834,7 @@
     return s;
   }
 
-  const BOILERPLATE = /(^|[\s_-])(share|sharing|social|subscribe|newsletter|promo|advert|advertisement|cookie|cookies|consent|related|recommended|breadcrumbs?|author-bio|popup|paywall|signup)([\s_-]|$)/i;
+  const BOILERPLATE = /(^|[\s_-])(share|sharing|social|subscribe|newsletter|promo|advert|advertisement|cookie|cookies|consent|related|recommended|breadcrumbs?|author-bio|popup|paywall|signup|footer)([\s_-]|$)/i;
 
   function isBoilerplate(el) {
     const s = `${attrOf(el, 'class')} ${attrOf(el, 'id')}`.trim();

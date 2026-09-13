@@ -1,11 +1,11 @@
-"""browser-mcp-rs vs @playwright/mcp: the same MCP calls on the same pages, measured the same way.
+"""browser-rs vs @playwright/mcp: the same MCP calls on the same pages, measured the same way.
 
 Each server navigates four real pages three times (the first navigation, which includes the
 browser launch, is reported separately), then takes one snapshot. RSS is summed over the whole
 process tree (server plus every browser process) after a 3 s settle.
 
     python3 scripts/bench_browser.py            # both
-    python3 scripts/bench_browser.py rust       # only browser-mcp-rs
+    python3 scripts/bench_browser.py rust       # only browser-rs
 """
 import json, os, subprocess, sys, time
 
@@ -87,6 +87,6 @@ def bench(name, cmd):
 if __name__ == "__main__":
     which = sys.argv[1:] or ["rust", "playwright"]
     if "rust" in which:
-        bench("browser-mcp-rs", [os.path.join(ROOT, "target/release/browser-mcp-rs"), "--isolated"])
+        bench("browser-rs", [os.path.join(ROOT, "target/release/browser-rs"), "--isolated"])
     if "playwright" in which:
         bench("@playwright/mcp", ["npx", "-y", "@playwright/mcp@0.0.80", "--headless", "--isolated", "--browser", "chromium"])

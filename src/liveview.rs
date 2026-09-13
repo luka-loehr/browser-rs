@@ -171,8 +171,8 @@ impl Browser {
                 connections: connections.clone(),
             },
         ));
-        eprintln!("browser-mcp-rs: hand-off viewer at {url}");
-        if std::env::var_os("BROWSER_MCP_NO_VIEWER").is_none() {
+        eprintln!("browser-rs: hand-off viewer at {url}");
+        if std::env::var_os("BROWSER_RS_NO_VIEWER").is_none() {
             open_viewer(&url);
         }
 

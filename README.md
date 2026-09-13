@@ -1,155 +1,189 @@
-# browser-mcp-rs
+![browser-rs — the browser your agent would pick](docs/assets/banner.svg)
 
-Browser automation for agents: a Rust MCP server that drives a **bundled, pinned Chromium** over
-the Chrome DevTools Protocol, with **`@playwright/mcp`'s tool names and parameters**. No Node, no
-Playwright library, no driver process: one small binary talking to Chromium over two pipes.
+# browser-rs
 
-- **Headless, with an in-place hand-off.** When a human has to act (log in, 2FA, a CAPTCHA,
-  payment details), the agent calls `browser_handoff`: a live view of the current tab opens in a
-  window, the person clicks, types and pastes into the running page, then clicks **Done**. Nothing
-  restarts or reloads, so the page keeps its exact state, and no browser appears in the Dock.
-- **Trusted input.** Clicks, typing, keys, drags and drops go through `Input.dispatch*`, so the
-  page sees real events (`isTrusted === true`), not JavaScript imitations.
-- **Fewer tokens per step.** After the first snapshot of a page, action replies contain only the
-  snapshot lines that changed, and `browser_batch` runs several steps in one call.
+[![Rust](https://img.shields.io/badge/Rust-2021-ce422b?style=flat&logo=rust)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-server-7c5cff?style=flat)](https://modelcontextprotocol.io) [![Chromium](https://img.shields.io/badge/Chromium-153-4285f4?style=flat&logo=googlechrome&logoColor=white)](https://googlechromelabs.github.io/chrome-for-testing/) [![Platform](https://img.shields.io/badge/Platform-macOS-lightgrey?style=flat&logo=apple)](#8-limits) [![License](https://img.shields.io/badge/License-MIT-orange?style=flat)](LICENSE)
 
-Measured against `@playwright/mcp` on the same four real pages (see
-[BENCHMARKS.md](../docs/BENCHMARKS.md)): **535 MB across 5 processes vs 1,496 MB across 9**,
-navigations 20–35% faster, server ready in 3–6 ms.
+I wanted a browser my agents actually like using. So I built one in Rust, on a bundled Chromium,
+with the tools of Microsoft's Playwright MCP, and then let Opus agents do real, multi-step work with
+it and fixed everything they complained about, round after round.
 
-## Chromium
+It uses **535 MB where Playwright MCP needs 1,496 MB** over the same four real pages, navigates
+20–35% faster, and is ready in 3–6 ms. It reads pages as Markdown instead of giant snapshots, runs
+many steps per call, and when a login needs a human, it hands them the exact live page without
+reloading anything.
 
-Two Chrome for Testing builds of the same pinned version (`153.0.8010.36`), downloaded once into
-`~/Library/Caches/browser-mcp-rs/chromium` (Linux: `~/.cache/browser-mcp-rs`):
+Website: [browser-rs.lukaloehr.com](https://browser-rs.lukaloehr.com)
 
-| Build | Used for | Download |
-|---|---|---|
-| `chrome-headless-shell` | headless mode (default) | ~99 MB, on the first tool call |
-| `chrome` (full browser) | headed mode (`--headed`, `browser_set_mode`) | ~191 MB, only the first time headed mode is used |
+---
 
-`browser-mcp-rs install` downloads both ahead of time. `--executable-path` (or
-`BROWSER_MCP_EXECUTABLE`) uses your own Chromium or Chrome instead. Chromium starts lazily on the
-first tool call and stops when the MCP connection closes. A tiny watchdog process next to each
-browser stops it if the server dies abruptly (crash, SIGKILL), so no Chromium is ever left behind.
+## 1. What it does
 
-The profile lives in `<cache>/profile` and persists logins between sessions. If another session
-already holds it, the server falls back to a temporary profile. `--isolated` always uses a
-temporary profile, and `--user-data-dir` picks your own.
+- **Playwright MCP's tools, same names and parameters.** 34 by default, 79 with `--caps all`:
+  navigation, snapshots with element refs, trusted clicks, typing, drag and drop, dialogs, uploads,
+  tabs, network mocking, cookies and storage, screenshots, PDF, tracing, video, test assertions.
+- **Reading without snapshots.** `browser_text` returns the page as Markdown (the article, one
+  section, or just the opening paragraph), `browser_links` lists links as one line each,
+  `browser_table`, `browser_extract` and `browser_read` pull exactly the values you need.
+- **Fewer round trips.** `browser_batch` runs navigate, type, click, wait and read in one call, and
+  a `read` step with `equals` turns into an assertion. Every action can skip its snapshot
+  (`snapshot: "none"`); by default a reply shows only the lines that changed.
+- **The web beyond the page.** `browser_fetch` sends HTTP with the browser's cookies directly (no
+  CORS), trimming JSON to the `fields` you ask for or running a `transform`. `browser_scrape` reads
+  many URLs at once in background tabs.
+- **In-place human hand-off.** `browser_handoff` opens a live view of the running page in a tab of
+  your own browser. You click, type, paste and answer dialogs; nothing restarts or reloads.
+- **Measured, not guessed.** Every reply ends with `elapsed_ms`; `BROWSER_RS_TRACE=<file>` logs each
+  call with its duration and reply size.
 
-## Tools
+## 2. Built by its users
 
-Same names and parameters as `@playwright/mcp`. Element parameters (`target`) take a ref from the
-snapshot (`e12`), a CSS selector, `text=…` or `role=button[name="…"]`; `ref` is accepted as an
-alias.
+Six Opus agents, restricted to browser-rs, each got a hard real-world task: researching GitHub pull
+requests, a Wikipedia link race, Hacker News with the linked articles, a full e-commerce checkout
+with its error cases, fourteen tricky widgets (dialogs, uploads, iframes, shadow DOM, drag and drop),
+and debugging on MDN. Each timed its steps with the server's own numbers and reported bugs, friction
+and the tools it wished it had. Their requests became the code between rounds.
 
-**Core (always on):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`,
-`browser_find`, `browser_click`, `browser_hover`, `browser_type`, `browser_fill_form`,
-`browser_select_option`, `browser_press_key`, `browser_drag`, `browser_drop`,
-`browser_file_upload`, `browser_handle_dialog`, `browser_evaluate`, `browser_wait_for`,
-`browser_take_screenshot`, `browser_resize`, `browser_tabs`, `browser_console_messages`,
-`browser_network_requests`, `browser_network_request`, `browser_close`, `browser_install`
+| Round | Scores (0–10) | Satisfied | Would pick over Playwright MCP | Cost |
+|---|---|---|---|---|
+| 1 | 5 · 8 · 7 · 7 · 5 · 5 | 0 of 6 | 3 of 6 | $4.57 |
+| 2 | 7 · 8 · 7 · 8 · 7 · 8 | 0 of 6 | 6 of 6 | $2.71 |
+| 3 | 8 · 8 · 7 · 8 · 8 · 7 | 4 of 6 | 6 of 6 | $2.67 |
 
-**Additions:**
+The Wikipedia race went from 75,000 characters of tool replies and 7.6 s of browser time to 3,400
+characters and 0.9 s. The harness lives outside this repo; the tasks and prompts are described in
+the commit history.
 
-| Tool | What it does |
+## 3. System
+
+```
+ agent ──stdio/MCP──▶ browser-rs (Rust, ~9.5 MB)
+                         │  DevTools Protocol over two pipes (fd 3/4), no websocket, no port
+                         ▼
+               chrome-headless-shell 153 ─── headless work (default)
+               Chrome for Testing 153 ────── only for --headed / browser_set_mode
+                         │
+          hand-off:  Page.startScreencast ──▶ 127.0.0.1 viewer (random token) ──▶ your browser tab
+                     trusted Input.dispatch* ◀── mouse, keys, paste, dialogs ◀──┘
+```
+
+A `--watchdog` process next to each Chromium holds a pipe from the server and takes the whole
+browser process group down if the server dies, even by SIGKILL. No orphaned Chromium, ever.
+
+## 4. Architecture
+
+| Path | Role |
 |---|---|
-| `browser_handoff` | Hand the running browser to a human through a live view (click, type, paste, dialogs, tabs) and wait for **Done** or a timeout. Exact page state, no reload |
-| `browser_set_mode` | Switch between `headless` and `headed` explicitly (relaunches Chromium, pages reload) |
-| `browser_batch` | Run several tools in order in one call and get one snapshot at the end |
+| `src/cdp.rs` | DevTools Protocol client on `--remote-debugging-pipe`: NUL-delimited JSON, one event handler, one-shot waiters |
+| `src/install.rs` | Downloads and locates the pinned Chrome for Testing builds |
+| `src/browser.rs` | Launch, tab state from CDP events, navigation with HTTP status, headless ↔ headed relaunch, watchdog |
+| `src/actions.rs` | Trusted input, evaluate, screenshots, PDF, storage, routes, server-side fetch, parallel scrape, tracing, video |
+| `src/injected.js` | Runs in an isolated world of every page: accessibility snapshot and refs, actionability checks, Markdown, links, tables, reads |
+| `src/response.rs` | Playwright-style replies, snapshot modes and diffs, compact console summary |
+| `src/tools.rs` | The MCP tools, per-call options, batch dispatch, timing and tracing |
+| `src/liveview.rs`, `src/liveview.html` | The hand-off viewer: token-protected local server, screencast relay, input forwarding |
+| `src/keys.rs` | Playwright key names to CDP key events |
+| `scripts/bench_browser.py` | The benchmark against `@playwright/mcp` |
 
-**Opt-in with `--caps`** (`--caps all` enables everything, 72 tools):
+Before every click the page runtime waits until the element is attached, visible, stable, not
+animating, enabled and actually hit at its center; if something covers it, the error names what.
 
-| Capability | Tools |
-|---|---|
-| `vision` | `browser_mouse_click_xy`, `browser_mouse_move_xy`, `browser_mouse_drag_xy`, `browser_mouse_down`, `browser_mouse_up`, `browser_mouse_wheel` |
-| `pdf` | `browser_pdf_save` |
-| `network` | `browser_route`, `browser_route_list`, `browser_unroute`, `browser_network_state_set` |
-| `storage` | `browser_cookie_*`, `browser_localstorage_*`, `browser_sessionstorage_*`, `browser_storage_state`, `browser_set_storage_state` |
-| `devtools` | `browser_highlight`, `browser_hide_highlight`, `browser_start_tracing`, `browser_stop_tracing`, `browser_start_video`, `browser_stop_video`, `browser_video_chapter`, `browser_video_show_actions`, `browser_video_hide_actions`, `browser_start_recording`, `browser_stop_recording` |
-| `testing` | `browser_generate_locator`, `browser_verify_element_visible`, `browser_verify_text_visible`, `browser_verify_list_visible`, `browser_verify_value` |
-| `config` | `browser_get_config` |
+## 5. Quickstart
 
-## Replies
+```sh
+git clone https://github.com/luka-loehr/browser-rs
+cd browser-rs && cargo build --release
+claude mcp add browser-rs "$PWD/target/release/browser-rs"
+```
 
-Replies use Playwright MCP's sections (`### Result`, `### Page`, `### Modal state`,
-`### Snapshot`, new console errors and warnings, events such as opened tabs or finished downloads).
-Two differences:
+Chromium downloads itself on the first tool call (chrome-headless-shell, ~99 MB), or ahead of time
+with `target/release/browser-rs install`, which also fetches the full browser for headed mode. The
+cache is `~/Library/Caches/browser-rs` (Linux: `~/.cache/browser-rs`).
 
-- **Snapshots are inline and incremental.** An action on a page already snapshotted returns only
-  the changed lines, with their ancestors marked `# unchanged` for context
-  (`--snapshot-mode incremental|full|none`). Playwright 0.0.80 instead writes each snapshot to a
-  file the agent has to read.
-- **Large pages are capped.** Action replies inline at most 16,000 characters of snapshot and
-  `browser_snapshot` at most `--snapshot-max-chars` (default 50,000). Anything longer is saved to a
-  file in the output directory, and the reply points to `browser_find` or `target`/`depth`.
+Or paste this into your agent and let it do the setup:
 
-## Options
+```
+Install browser-rs for me. Run `curl -fsSL https://browser-rs.lukaloehr.com/setup.txt`
+first, then follow it exactly.
+```
+
+## 6. Tools
+
+**Default (34):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_find`,
+`browser_click`, `browser_hover`, `browser_type`, `browser_fill_form`, `browser_select_option`,
+`browser_press_key`, `browser_drag`, `browser_drop`, `browser_file_upload`, `browser_handle_dialog`,
+`browser_evaluate`, `browser_wait_for`, `browser_take_screenshot`, `browser_resize`, `browser_tabs`,
+`browser_console_messages`, `browser_network_requests`, `browser_network_request`, `browser_close`,
+`browser_install`, and the agent tools `browser_text`, `browser_links`, `browser_table`,
+`browser_extract`, `browser_read`, `browser_fetch`, `browser_scrape`, `browser_batch`,
+`browser_handoff`, `browser_set_mode`.
+
+**With `--caps`:** `vision` (coordinate mouse), `pdf`, `network` (route, offline), `storage`
+(cookies, localStorage, sessionStorage, storage state), `devtools` (tracing, video, highlights,
+recording), `testing` (locators, verify), `config`. `--caps all` enables everything.
+
+**Targets** accept a snapshot ref (`e12`), a CSS selector (the first visible match wins;
+`iframe#x >> body` enters an iframe or shadow root), `text=…`, `role=button[name="…"]`,
+`link=<regex>` or `href=/wiki/C++`.
+
+**The fast way to drive it:**
+
+1. Read with `browser_text`, `browser_links`, `browser_table`, `browser_extract`, `browser_read` or
+   `browser_fetch`, not snapshots.
+2. Act with refs or selectors, several steps per `browser_batch`, `snapshot: "none"` when you don't
+   need to see the page.
+3. Read many pages with `browser_scrape`; trim APIs with `browser_fetch` `fields` or `transform`.
+4. Hand the page to a person with `browser_handoff` when they have to log in.
+
+## 7. Options
 
 Same names as `@playwright/mcp` where they exist:
 
 ```
 --headless / --headed           start headless (default) or with a visible window
 --caps <list>                   vision,pdf,network,storage,devtools,testing,config or all
---executable-path <path>        --user-data-dir <path>        --isolated
---storage-state <path>          --viewport-size <WxH>         --user-agent <ua>
---proxy-server <url>            --proxy-bypass <domains>      --ignore-https-errors
---block-service-workers         --allowed-origins <a;b>       --blocked-origins <a;b>
---init-script <path>            --output-dir <path>           --test-id-attribute <name>
---snapshot-mode <mode>          --snapshot-max-chars <n>
+--executable-path <path>        your own Chromium or Chrome (also BROWSER_RS_EXECUTABLE)
+--user-data-dir <path>          --isolated                    --storage-state <path>
+--viewport-size <WxH>           --user-agent <ua>             --ignore-https-errors
+--proxy-server <url>            --proxy-bypass <domains>      --block-service-workers
+--allowed-origins <a;b>         --blocked-origins <a;b>       --init-script <path>
+--output-dir <path>             --test-id-attribute <name>
+--snapshot-mode <mode>          incremental (default), full or none
+--snapshot-max-chars <n>        default 50000; action replies inline at most 8000
 --timeout-action <ms> (5000)    --timeout-navigation <ms> (60000)    --timeout-settle <ms> (500)
 ```
 
-## How it works
+Environment: `BROWSER_RS_CACHE`, `BROWSER_RS_TRACE`, `BROWSER_RS_NO_VIEWER` (tests), `BROWSER_RS_DEBUG`.
 
-| File | Role |
-|---|---|
-| `src/cdp.rs` | DevTools Protocol client on `--remote-debugging-pipe` (fd 3/4, NUL-delimited JSON) |
-| `src/install.rs` | Downloads and locates the pinned Chrome for Testing builds |
-| `src/browser.rs` | Launch, per-tab state from CDP events, headless ↔ headed relaunch |
-| `src/actions.rs` | Trusted input, screenshots, PDF, storage, routes, tracing, video, hand-off |
-| `src/injected.js` | Runs in an isolated world of every page: snapshot and refs, actionability checks, highlights, recorder |
-| `src/liveview.rs`, `src/liveview.html` | The hand-off viewer: local token-protected server, screencast relay, input forwarding |
-| `src/response.rs` | Reply formatting and snapshot diffs |
-| `src/tools.rs` | The MCP tools |
+## 8. Limits
 
-Before every click, the injected runtime waits until the element is attached, visible, stable,
-enabled and actually receives the pointer at its center. If something covers it, the error names
-the covering element.
+- Tested on macOS. Linux uses the same code but is untested; Windows is not supported (the pipe
+  transport and the watchdog are Unix-only).
+- In the hand-off view, headless Chromium does not draw native `<select>` dropdowns, date pickers or
+  file choosers, and passkeys do not work; use a one-time code or a password.
+- `browser_set_mode` relaunches Chromium, so pages reload; use `browser_handoff` when state matters.
+- Not implemented: `browser_run_code_unsafe` (needs Playwright's Node runtime), `browser_annotate`,
+  `browser_resume`, and the `--device`, `--mobile`, `--init-page` and `--config` options.
+- Cross-origin iframes are not part of snapshots; same-origin iframes and open shadow roots are.
 
-**Hand-off.** The headless browser never changes. `browser_handoff` starts a server on 127.0.0.1
-behind a random 128-bit token and opens it as an app window of your own Chrome (or your default
-browser). The window streams the current tab through CDP's screencast and sends mouse, keyboard
-and paste back as trusted input events. JavaScript dialogs appear in the viewer, tabs opened by the
-page are followed, and **Done**, closing the viewer or the timeout returns control to the agent.
-The server shuts down when the hand-off ends.
+## 9. Benchmarks
 
-**Explicit mode switch.** Chromium cannot switch between headless and headed while running, so
-`browser_set_mode` closes Chromium and relaunches it on the same profile. It copies cookies
-(session cookies too) and sessionStorage across and reopens the tabs. **Pages reload, so unsaved
-in-page state is lost**; use `browser_handoff` when state matters.
+Against `@playwright/mcp@0.0.80`, both on chrome-headless-shell, same four pages (example.com, a
+Wikipedia article, Hacker News, a GitHub repository), three rounds, medians, memory summed over the
+whole process tree. Reproduce with `python3 scripts/bench_browser.py`.
 
-## Not implemented
+| | browser-rs | Playwright MCP |
+|---|---|---|
+| Memory after 4 pages | **535 MB · 5 processes** | 1,496 MB · 9 processes |
+| Navigate Wikipedia / Hacker News / GitHub | **214 / 185 / 274 ms** | 315 / 229 / 330 ms |
+| `browser_snapshot` on GitHub | **26 ms** | 36 ms |
+| Server ready | **3–6 ms** | 574 ms |
+| Tool schemas in the agent's context | **15.9k chars** | 19.5k chars |
 
-- `browser_run_code_unsafe` (runs Playwright code in Playwright's Node process),
-  `browser_annotate` and `browser_resume` (Playwright Dashboard / test runner features).
-- The `--device`, `--mobile`, `--init-page`, `--save-session`, `--output-max-size` and
-  `--config` options.
-- Cross-origin iframes are not part of the snapshot (same-origin iframes are).
-- In the hand-off viewer, native `<select>` dropdowns and date pickers are not drawn by headless
-  Chromium (keyboard selection works), a file chooser cannot be opened, and passkeys do not work
-  (use a one-time code or password instead).
-- `browser_stop_video` needs `ffmpeg` on `PATH` to produce a `.webm`; without it the frames stay
-  on disk as JPEGs.
-- Recording (`browser_start_recording`) captures clicks, fills, checks, selections and
-  Enter/Escape/Tab presses.
-- macOS only is tested. Linux uses the same code path but is untested; Windows is not supported
-  (the pipe transport is Unix-only).
+## 10. License
 
-## Run
+MIT, see [LICENSE](LICENSE). Tool names follow Microsoft's `@playwright/mcp`; no Playwright code is
+included. Chromium for Testing is downloaded from Google under its own licences.
 
-```sh
-cargo build --release -p browser-mcp-rs
-claude mcp add browser-rs "$PWD/target/release/browser-mcp-rs"
-```
-
-Set `BROWSER_MCP_DEBUG=1` to log target attachments to stderr.
+Made by [Luka Löhr](https://lukaloehr.com). This repository grew out of
+`rust-mcp-servers`, whose browser server it was; its history is kept here.

@@ -440,7 +440,7 @@ impl Browser {
     /// The persistent profile, unless another live browser holds it (then a throwaway one).
     fn profile_dir(&self) -> Result<(PathBuf, bool)> {
         let temp = || -> Result<(PathBuf, bool)> {
-            let dir = std::env::temp_dir().join(format!("browser-mcp-rs-profile-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("browser-rs-profile-{}", std::process::id()));
             Ok((dir, true))
         };
         if self.cfg.isolated {
@@ -454,7 +454,7 @@ impl Browser {
                 if self.cfg.user_data_dir.is_some() {
                     bail!("profile {} is in use by another browser (pid {pid})", dir.display());
                 }
-                eprintln!("browser-mcp-rs: default profile in use by pid {pid}; using a temporary profile");
+                eprintln!("browser-rs: default profile in use by pid {pid}; using a temporary profile");
                 return temp();
             }
         }
@@ -1039,7 +1039,7 @@ fn on_event(ev: &Event, state: &Arc<Mutex<State>>, cdp: Option<Arc<Cdp>>, rt: &t
             let Some(cdp) = cdp else { return };
             let child = p["sessionId"].as_str().unwrap_or_default().to_string();
             let info = &p["targetInfo"];
-            if std::env::var_os("BROWSER_MCP_DEBUG").is_some() {
+            if std::env::var_os("BROWSER_RS_DEBUG").is_some() {
                 eprintln!("[attach] session={} parent={:?} {}", child, session, info);
             }
             if info["type"] != "page" {

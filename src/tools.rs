@@ -1379,7 +1379,8 @@ impl BrowserServer {
         let Some(target) = input.as_str().map(str::to_string) else { bail!("clicked the search button, but no search box appeared") };
         self.browser.fill(&page, &target, &p.query).await?;
         if p.submit.unwrap_or(true) {
-            self.browser.settle(&page, self.browser.press(&page, "Enter")).await?;
+            // Search pages often route client-side, so a navigation may never be reported: bound the wait.
+            let _ = tokio::time::timeout(Duration::from_secs(6), self.browser.settle(&page, self.browser.press(&page, "Enter"))).await;
         } else {
             tokio::time::sleep(Duration::from_millis(800)).await;
         }

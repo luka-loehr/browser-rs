@@ -19,7 +19,7 @@ Website: [browser-rs.lukaloehr.com](https://browser-rs.lukaloehr.com)
 
 ## 1. What it does
 
-- **Playwright MCP's tools, same names and parameters.** 34 by default, 79 with `--caps all`:
+- **Playwright MCP's tools, same names and parameters.** 38 by default, 83 with `--caps all`:
   navigation, snapshots with element refs, trusted clicks, typing, drag and drop, dialogs, uploads,
   tabs, network mocking, cookies and storage, screenshots, PDF, tracing, video, test assertions.
 - **Reading without snapshots.** `browser_text` returns the page as Markdown (the article, one
@@ -51,6 +51,8 @@ and the tools it wished it had. Their requests became the code between rounds.
 | 2 | 7 · 8 · 7 · 8 · 7 · 8 | 0 of 6 | 6 of 6 | $2.71 |
 | 3 | 8 · 8 · 7 · 8 · 8 · 7 | 4 of 6 | 6 of 6 | $2.67 |
 | 4 | 8 · 8 · 7 · 9 · 8 · 8 | 2 of 6 | 6 of 6 | $1.67 |
+| 5 | 8 · 8 · 7 · 8 · 8 · 6 | 2 of 6 | 6 of 6 | $2.67 |
+| 6 | 8 · 8 · 9 · 8 · 8 · 8 | 4 of 6 | 6 of 6 | $2.36 |
 
 The Wikipedia race went from 75,000 characters of tool replies and 7.6 s of browser time to 3,400
 characters and 0.9 s. The harness lives outside this repo; the tasks and prompts are described in
@@ -111,13 +113,14 @@ first, then follow it exactly.
 
 ## 6. Tools
 
-**Default (34):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_find`,
+**Default (38):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_find`,
 `browser_click`, `browser_hover`, `browser_type`, `browser_fill_form`, `browser_select_option`,
 `browser_press_key`, `browser_drag`, `browser_drop`, `browser_file_upload`, `browser_handle_dialog`,
 `browser_evaluate`, `browser_wait_for`, `browser_take_screenshot`, `browser_resize`, `browser_tabs`,
 `browser_console_messages`, `browser_network_requests`, `browser_network_request`, `browser_close`,
 `browser_install`, and the agent tools `browser_text`, `browser_links`, `browser_table`,
 `browser_extract`, `browser_read`, `browser_fetch`, `browser_scrape`, `browser_batch`,
+`browser_search`, `browser_check`, `browser_scroll_until`, `browser_run_snippet`,
 `browser_handoff`, `browser_set_mode`.
 
 **With `--caps`:** `vision` (coordinate mouse), `pdf`, `network` (route, offline), `storage`

@@ -975,7 +975,9 @@ async fn wayback_snapshot(url: &str) -> Option<String> {
     let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(api)).await.ok()?.ok()?;
     let body: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
     let closest = &body["archived_snapshots"]["closest"];
-    (closest["available"] == true && closest["status"] == "200").then(|| closest["url"].as_str().map(|u| u.replacen("http://", "https://", 1))).flatten()
+    // A capture that redirected (3xx) still leads to real archived content; errors (4xx/5xx) do not.
+    let usable = closest["status"].as_str().is_some_and(|s| s.starts_with('2') || s.starts_with('3'));
+    (closest["available"] == true && usable).then(|| closest["url"].as_str().map(|u| u.replacen("http://", "https://", 1))).flatten()
 }
 
 pub fn truncate_chars(s: String, max: usize) -> String {

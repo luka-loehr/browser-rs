@@ -70,24 +70,11 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Opens the viewer as a chromeless app window of the user's own Chrome when installed, otherwise
-/// in the default browser.
+/// Opens the viewer as a new tab in the user's default browser, next to everything they already
+/// have open, rather than as a separate window.
 fn open_viewer(url: &str) {
-    let chrome_paths: &[&str] = if cfg!(target_os = "macos") {
-        &["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
-    } else {
-        &["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-    };
-    let spawn = |cmd: &str, args: &[String]| {
-        std::process::Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok()
-    };
-    for path in chrome_paths {
-        if std::path::Path::new(path).exists() && spawn(path, &[format!("--app={url}"), "--window-size=1320,920".into()]) {
-            return;
-        }
-    }
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    spawn(opener, &[url.to_string()]);
+    let _ = std::process::Command::new(opener).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
 fn mouse_params(m: &Value) -> Value {
@@ -126,12 +113,13 @@ fn key_params(m: &Value) -> Value {
 impl Browser {
     async fn start_screencast(&self, page: &PageRef) -> Result<()> {
         page.cdp
-            .send_session(&page.session, "Page.startScreencast", json!({ "format": "jpeg", "quality": 75, "maxWidth": 1920, "maxHeight": 1600, "everyNthFrame": 1 }))
+            // Every frame, at up to 2560px: sharp text; on localhost the larger JPEGs cost no noticeable latency.
+            .send_session(&page.session, "Page.startScreencast", json!({ "format": "jpeg", "quality": 85, "maxWidth": 2560, "maxHeight": 1600, "everyNthFrame": 1 }))
             .await
             .map_err(|e| anyhow!(e))?;
         // A static page may not repaint for a while; send one frame right away.
         let metrics = page.cdp.send_session(&page.session, "Page.getLayoutMetrics", json!({})).await.map_err(|e| anyhow!(e))?;
-        if let Ok(shot) = page.cdp.send_session(&page.session, "Page.captureScreenshot", json!({ "format": "jpeg", "quality": 75, "optimizeForSpeed": true })).await {
+        if let Ok(shot) = page.cdp.send_session(&page.session, "Page.captureScreenshot", json!({ "format": "jpeg", "quality": 85, "optimizeForSpeed": true })).await {
             let vv = &metrics["cssVisualViewport"];
             let params = json!({ "data": shot["data"], "metadata": { "deviceWidth": vv["clientWidth"], "deviceHeight": vv["clientHeight"], "offsetTop": 0, "pageScaleFactor": 1 } });
             if let Some(live) = self.state.lock().unwrap().live.as_ref().filter(|l| l.session == page.session) {
@@ -283,6 +271,8 @@ async fn serve(listener: TcpListener, ch: Channels) {
 }
 
 async fn connection(mut stream: TcpStream, ch: &Channels) -> Result<()> {
+    // Small input messages must go out immediately, not wait to be coalesced by Nagle's algorithm.
+    let _ = stream.set_nodelay(true);
     // Peek at the request line to route it; the WebSocket handshake then reads the request itself.
     let mut buf = [0u8; 1024];
     let n = tokio::time::timeout(Duration::from_secs(3), async {

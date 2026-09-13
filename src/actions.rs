@@ -969,6 +969,15 @@ pub struct FetchResult {
     pub json: Option<Value>,
 }
 
+/// The closest Internet Archive capture of `url` that returned HTTP 200, if there is one.
+async fn wayback_snapshot(url: &str) -> Option<String> {
+    let api = reqwest::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url)]).ok()?;
+    let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(api)).await.ok()?.ok()?;
+    let body: Value = resp.json().await.ok()?;
+    let closest = &body["archived_snapshots"]["closest"];
+    (closest["available"] == true && closest["status"] == "200").then(|| closest["url"].as_str().map(|u| u.replacen("http://", "https://", 1))).flatten()
+}
+
 pub fn truncate_chars(s: String, max: usize) -> String {
     if s.chars().count() <= max {
         return s;
@@ -1152,11 +1161,14 @@ impl Browser {
                         // readable from the Internet Archive.
                         let mut via = String::new();
                         if archive_fallback && status.is_some_and(|s| s >= 400) {
-                            let archived = format!("https://web.archive.org/web/2/{url}");
-                            if let Ok(s) = self.navigate(&page, &archived).await {
-                                if s.is_some_and(|s| s < 400) {
-                                    via = format!(", read via web.archive.org because the site answered HTTP {}", status.unwrap_or(0));
-                                    status = s;
+                            // Ask the Wayback availability API first: navigating blindly to an uncaptured
+                            // URL leaves the tab on a "not archived" page, whose text would be returned.
+                            if let Some(snapshot) = wayback_snapshot(&url).await {
+                                if let Ok(s) = self.navigate(&page, &snapshot).await {
+                                    if s.is_some_and(|s| s < 400) {
+                                        via = format!(", read from the Internet Archive because the site answered HTTP {}", status.unwrap_or(0));
+                                        status = s;
+                                    }
                                 }
                             }
                         }

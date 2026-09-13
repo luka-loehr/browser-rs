@@ -38,16 +38,16 @@ fn platform() -> Result<&'static str> {
 }
 
 pub fn cache_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("BROWSER_MCP_CACHE") {
+    if let Some(dir) = std::env::var_os("BROWSER_RS_CACHE") {
         return PathBuf::from(dir);
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
     if cfg!(target_os = "macos") {
-        home.join("Library/Caches/browser-mcp-rs")
+        home.join("Library/Caches/browser-rs")
     } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("browser-mcp-rs")
+        PathBuf::from(xdg).join("browser-rs")
     } else {
-        home.join(".cache/browser-mcp-rs")
+        home.join(".cache/browser-rs")
     }
 }
 
@@ -82,7 +82,7 @@ pub async fn ensure(product: Product) -> Result<PathBuf> {
 
     let top = folder(product, platform);
     let url = format!("https://storage.googleapis.com/chrome-for-testing-public/{CHROME_VERSION}/{platform}/{top}.zip");
-    eprintln!("browser-mcp-rs: downloading {} {CHROME_VERSION} once into {}", product.name(), dir.display());
+    eprintln!("browser-rs: downloading {} {CHROME_VERSION} once into {}", product.name(), dir.display());
     std::fs::create_dir_all(&dir)?;
     // Unique staging paths so two sessions installing at once never see each other's half-written files.
     let stamp = format!(
@@ -109,7 +109,7 @@ pub async fn ensure(product: Product) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&zip_path);
     let _ = std::fs::remove_dir_all(&staging);
     result?;
-    eprintln!("browser-mcp-rs: {} installed", product.name());
+    eprintln!("browser-rs: {} installed", product.name());
     Ok(exe)
 }
 
@@ -127,7 +127,7 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
             let pct = done * 100 / total;
             if pct >= last_pct + 10 {
                 last_pct = pct;
-                eprintln!("browser-mcp-rs: {pct}% of {} MB", total / 1_000_000);
+                eprintln!("browser-rs: {pct}% of {} MB", total / 1_000_000);
             }
         }
     }

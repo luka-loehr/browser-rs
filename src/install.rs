@@ -42,13 +42,21 @@ pub fn cache_root() -> PathBuf {
         return PathBuf::from(dir);
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Caches/browser-rs")
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Caches")
     } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("browser-rs")
+        PathBuf::from(xdg)
     } else {
-        home.join(".cache/browser-rs")
+        home.join(".cache")
+    };
+    let current = base.join("browser-rs");
+    // Before the rename the project was browser-mcp-rs: keep using a Chromium already downloaded
+    // there instead of fetching ~300 MB again. It is not moved, since an older server may be using it.
+    let previous = base.join("browser-mcp-rs");
+    if !current.exists() && previous.exists() {
+        return previous;
     }
+    current
 }
 
 fn version_dir() -> PathBuf {

@@ -525,9 +525,13 @@
   }
 
   function notEditable(el) {
-    const readOnlyEditor = el.closest && el.closest('[contenteditable="false"]');
-    return new Error(`${describe(el)} is not editable: it is not an input, a textarea or a contenteditable element` +
-      (readOnlyEditor ? '. It sits inside contenteditable="false", so this is a read-only editor; rich-text editors usually offer their own API (e.g. tinymce.activeEditor.setContent) via browser_evaluate' : ''));
+    // Rich-text editors mark their surface with a class; when it is not editable, the editor is in a
+    // read-only state and has to be driven through its own API.
+    const editor = el.closest && el.closest('.mce-content-body, .ProseMirror, .ql-editor, .cke_editable, [data-slate-editor], [data-lexical-editor], [contenteditable="false"]');
+    const hint = !editor ? '' : editor.classList.contains('mce-content-body')
+      ? '. This is a TinyMCE editor that is not editable right now (read-only); set its content with browser_evaluate, e.g. "() => tinymce.activeEditor.setContent(\'<p>text</p>\')"'
+      : '. This is a rich-text editor surface that is not editable right now (read-only); use the editor\'s own API through browser_evaluate';
+    return new Error(`${describe(el)} is not editable: it is not an input, a textarea or a contenteditable element${hint}`);
   }
 
   // Focuses the element and selects its current content so trusted Input.insertText replaces it.
@@ -814,8 +818,14 @@
         .replace(/\s*\b(published|updated|posted|on)\b.*$/i, '')
         .replace(/\s*[|·•,–-]\s*$/, '')
         .trim();
+      // Read a byline without its avatar or logo children ("Blog Logo Chris Greening" -> "Chris Greening").
+      const bylineText = e => {
+        const copy = e.cloneNode(true);
+        copy.querySelectorAll('img, svg, picture, figure, [class*="image"], [class*="avatar"], [class*="logo"], [class*="photo"]').forEach(n => n.remove());
+        return copy.textContent;
+      };
       const byline = [...document.querySelectorAll('[itemprop=author] [itemprop=name], [rel=author], a[href*="/author/"], .author-name, .byline a, [itemprop=author], .byline, .author, [class*="byline"], [class*="author"]')]
-        .map(e => cleanByline(e.textContent))
+        .map(e => cleanByline(bylineText(e)))
         .find(t => t.length >= 3 && t.length <= 60 && !/\d{4}/.test(t) && !/\blogo\b/i.test(t));
       const author = metaContent(['author', 'article:author', 'parsely-author', 'dc.creator', 'twitter:creator']) || byline || '';
       const MONTH = '(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\\.?';

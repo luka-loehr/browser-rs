@@ -1981,7 +1981,7 @@ impl BrowserServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BrowserServer {
     /// Every tool call, timed: the reply ends with `elapsed_ms` so agents can reason about speed with
-    /// real numbers, and with BROWSER_MCP_TRACE=<file> each call is appended there as JSON.
+    /// real numbers, and with BROWSER_RS_TRACE=<file> each call is appended there as JSON.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -2009,7 +2009,7 @@ impl ServerHandler for BrowserServer {
             reply_chars = serde_json::to_string(&result.content).map(|s| s.len()).unwrap_or(0);
             result.content.push(rmcp::model::ContentBlock::text(format!("\nelapsed_ms: {ms}")));
         }
-        if let Some(path) = std::env::var_os("BROWSER_MCP_TRACE") {
+        if let Some(path) = std::env::var_os("BROWSER_RS_TRACE") {
             let line = json!({ "tool": tool, "ms": ms, "reply_chars": reply_chars, "args_chars": args_chars, "error": error });
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                 let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
@@ -2020,7 +2020,7 @@ impl ServerHandler for BrowserServer {
 
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("browser-mcp-rs", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("browser-rs", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Browser automation on a bundled Chromium, with @playwright/mcp's tool names plus agent-first tools. Headless. \
                  Fastest way to work: (1) read with browser_text (Markdown), browser_links, browser_table, browser_extract or \

@@ -36,7 +36,8 @@
 <script>
   const token = location.pathname.split('/').pop();
   const canvas = document.getElementById('screen');
-  const ctx = canvas.getContext('2d');
+  // desynchronized: frames reach the screen without waiting for the page's compositor.
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   const statusEl = document.getElementById('status');
   let meta = null;      // metadata of the frame currently drawn
   let pendingMeta = null;
@@ -51,7 +52,7 @@
     ws.onopen = () => { document.getElementById('dot').classList.remove('off'); statusEl.textContent = 'Waiting for the first frame…'; };
     ws.onclose = () => {
       document.getElementById('dot').classList.add('off');
-      if (finished) { statusEl.textContent = 'Handed back to the agent. You can close this window.'; canvas.style.opacity = .3; return; }
+      if (finished) { statusEl.textContent = 'Handed back to the agent. You can close this tab.'; canvas.style.opacity = .3; return; }
       statusEl.textContent = 'Disconnected, reconnecting…';
       setTimeout(connect, 800);
     };
@@ -92,12 +93,28 @@
         }
         return;
       }
-      const bmp = await createImageBitmap(new Blob([e.data], { type: 'image/jpeg' }));
+      drawFrame(e.data, pendingMeta);
+    };
+  }
+
+  // Decode off the main thread and draw only the newest frame: while one decodes, later frames
+  // replace each other instead of queueing, so the view never falls behind the page.
+  let decoding = false;
+  let queued = null;
+  async function drawFrame(buffer, frameMeta) {
+    if (decoding) { queued = [buffer, frameMeta]; return; }
+    decoding = true;
+    try {
+      const bmp = await createImageBitmap(new Blob([buffer], { type: 'image/jpeg' }));
       if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
       ctx.drawImage(bmp, 0, 0);
-      meta = pendingMeta;
+      bmp.close();
+      meta = frameMeta;
       statusEl.textContent = '';
-    };
+    } finally {
+      decoding = false;
+    }
+    if (queued) { const [b, m] = queued; queued = null; drawFrame(b, m); }
   }
   connect();
 

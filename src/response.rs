@@ -104,7 +104,7 @@ impl Browser {
     }
 
     /// Action replies carry at most this much snapshot inline; browser_snapshot gets the full limit.
-    const ACTION_SNAPSHOT_CHARS: usize = 16_000;
+    const ACTION_SNAPSHOT_CHARS: usize = 8_000;
 
     fn snapshot_block_capped(&self, snap: &str, max: usize) -> String {
         if max == 0 || snap.len() <= max {
@@ -147,31 +147,50 @@ impl Browser {
                     }
                 }
                 let mut snapshot_text = None;
-                if reply.snapshot && !reply.error && self.cfg.snapshot_mode != "none" {
+                // Per-call `snapshot` argument, else the --snapshot-mode default.
+                let requested = self.overrides.lock().unwrap().snapshot.clone().unwrap_or_else(|| self.cfg.snapshot_mode.clone());
+                let mode = match requested.as_str() {
+                    "none" | "off" | "false" => "none",
+                    "full" => "full",
+                    "main" => "main",
+                    _ => "diff",
+                };
+                if reply.snapshot && !reply.error && mode != "none" {
                     let has_dialog = self.tab_read(&page, |t| t.dialog.is_some()).unwrap_or(false);
                     if !has_dialog {
-                        let snap = self.snapshot(&page, None, None, false).await;
+                        let snap = if mode == "main" {
+                            match self.snapshot(&page, Some("main, [role=main], article"), None, false).await {
+                                Ok(s) => Ok(s),
+                                Err(_) => self.snapshot(&page, None, None, false).await,
+                            }
+                        } else {
+                            self.snapshot(&page, None, None, false).await
+                        };
                         if let Err(e) = &snap {
                             snapshot_text = Some(format!("### Snapshot\nCould not capture a snapshot: {e:#}\n"));
                         }
                         if let Ok(snap) = snap {
                             let prev = self.tab_read(&page, |t| t.last_snapshot.clone()).ok().flatten();
-                            let delta = match (&prev, self.cfg.snapshot_mode.as_str()) {
-                                (Some(prev), "incremental") => snapshot_delta(prev, &snap),
+                            let delta = match (&prev, mode) {
+                                (Some(prev), "diff") => snapshot_delta(prev, &snap),
                                 _ => None,
                             };
                             snapshot_text = Some(match delta {
                                 Some(d) if d.is_empty() => "### Snapshot\nNo changes since the last snapshot.\n".to_string(),
                                 Some(d) => format!("### Snapshot (changes)\n```yaml\n{d}\n```\n"),
                                 None => {
-                                    let max = match self.cfg.snapshot_max_chars {
-                                        0 => Self::ACTION_SNAPSHOT_CHARS,
-                                        n => n.min(Self::ACTION_SNAPSHOT_CHARS),
+                                    let max = match (mode, self.cfg.snapshot_max_chars) {
+                                        ("full", n) => n,
+                                        (_, 0) => Self::ACTION_SNAPSHOT_CHARS,
+                                        (_, n) => n.min(Self::ACTION_SNAPSHOT_CHARS),
                                     };
                                     format!("### Snapshot\n{}\n", self.snapshot_block_capped(&snap, max))
                                 }
                             });
-                            let _ = self.tab_write(&page, |t| t.last_snapshot = Some(snap));
+                            // A main-only snapshot is partial, so it must not become the diff baseline.
+                            if mode != "main" {
+                                let _ = self.tab_write(&page, |t| t.last_snapshot = Some(snap));
+                            }
                         }
                     }
                 }
@@ -186,8 +205,12 @@ impl Browser {
                     };
                     let fresh: Vec<String> = tab.console[tab.console_reported.min(tab.console.len())..]
                         .iter()
-                        .filter(|m| m.level == "error" || m.level == "warning")
-                        .map(|m| format!("- [{}] {}", m.level.to_uppercase(), m.text.lines().next().unwrap_or_default()))
+                        // Failed resource loads are already in the network log; in every reply they are just noise.
+                        .filter(|m| (m.level == "error" || m.level == "warning") && !m.text.starts_with("Failed to load resource"))
+                        .map(|m| {
+                            let line: String = m.text.lines().next().unwrap_or_default().chars().take(160).collect();
+                            format!("- [{}] {line}", m.level.to_uppercase())
+                        })
                         .collect();
                     tab.console_reported = tab.console.len();
                     if !notices.is_empty() {
@@ -203,14 +226,14 @@ impl Browser {
                 if tabs > 1 {
                     out.push_str(&format!("- Tabs: {tabs} open, current is {current}\n"));
                 }
+                // Counts only: the messages themselves are rarely what the agent is after, and
+                // browser_console_messages has them in full.
                 if !console.is_empty() {
-                    let shown = console.len().min(10);
-                    out.push_str("### New console messages\n");
-                    out.push_str(&console[console.len() - shown..].join("\n"));
-                    if console.len() > shown {
-                        out.push_str(&format!("\n- … {} more; use browser_console_messages", console.len() - shown));
-                    }
-                    out.push('\n');
+                    let errors = console.iter().filter(|l| l.starts_with("- [ERROR]")).count();
+                    out.push_str(&format!(
+                        "- Console: {errors} new error(s), {} warning(s) (browser_console_messages)\n",
+                        console.len() - errors
+                    ));
                 }
                 if let Some(d) = dialog {
                     out.push_str(&format!(

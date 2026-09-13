@@ -973,7 +973,7 @@ pub struct FetchResult {
 async fn wayback_snapshot(url: &str) -> Option<String> {
     let api = reqwest::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url)]).ok()?;
     let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(api)).await.ok()?.ok()?;
-    let body: Value = resp.json().await.ok()?;
+    let body: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
     let closest = &body["archived_snapshots"]["closest"];
     (closest["available"] == true && closest["status"] == "200").then(|| closest["url"].as_str().map(|u| u.replacen("http://", "https://", 1))).flatten()
 }

@@ -67,6 +67,8 @@ pub struct Request {
     pub failure: Option<String>,
     pub finished: bool,
     pub from_route: bool,
+    pub started: Option<Instant>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,9 +166,18 @@ struct Running {
     temp_profile: bool,
 }
 
+/// Per-call options read from a tool call's arguments (`snapshot`, `timeout`) and reset afterwards.
+/// Calls are serialized, so one slot is enough.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub snapshot: Option<String>,
+    pub timeout: Option<Duration>,
+}
+
 pub struct Browser {
     pub cfg: Config,
     pub state: Arc<Mutex<State>>,
+    pub overrides: Mutex<Overrides>,
     running: tokio::sync::Mutex<Option<Running>>,
     /// Mode the next launch uses; flips on set_headless.
     want_headless: Mutex<bool>,
@@ -188,6 +199,7 @@ impl Browser {
         Arc::new(Self {
             cfg,
             state: Arc::new(Mutex::new(state)),
+            overrides: Mutex::new(Overrides::default()),
             running: tokio::sync::Mutex::new(None),
             want_headless: Mutex::new(headless),
             rt: tokio::runtime::Handle::current(),
@@ -482,7 +494,8 @@ impl Browser {
 
     // ------------------------------------------------------------------ navigation
 
-    pub async fn navigate(&self, page: &PageRef, url: &str) -> Result<()> {
+    /// Navigates and waits for the load; returns the main document's HTTP status when there is one.
+    pub async fn navigate(&self, page: &PageRef, url: &str) -> Result<Option<i64>> {
         let url = normalize_url(url);
         self.check_origin(&url)?;
         let mut loading = self.tab_watch(page, |t| t.loading.subscribe())?;
@@ -496,12 +509,12 @@ impl Browser {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let st = self.state.lock().unwrap();
             if err == "net::ERR_ABORTED" && st.downloads.iter().any(|d| d.url == url) {
-                return Ok(());
+                return Ok(None);
             }
             bail!("navigation to {url} failed: {err}");
         }
         let Some(loader) = res["loaderId"].as_str().map(str::to_string) else {
-            return Ok(()); // same-document navigation
+            return Ok(None); // same-document navigation
         };
         let deadline = Instant::now() + self.cfg.timeout_navigation;
         loop {
@@ -510,7 +523,8 @@ impl Browser {
                 st.tabs.iter().find(|t| t.session_id == page.session).map(|t| t.loader_id == loader && !*t.loading.borrow())
             };
             match done {
-                Some(true) => return Ok(()),
+                // The navigation request's id is its loader id.
+                Some(true) => return Ok(self.tab_read(page, |t| t.requests.iter().rev().find(|r| r.id == loader).and_then(|r| r.status)).ok().flatten()),
                 None => bail!("tab closed during navigation"),
                 _ => {}
             }
@@ -749,7 +763,7 @@ impl Browser {
         Ok(format!("switched to {} mode ({} tab(s) restored)", if headless { "headless" } else { "headed" }, saved.len()))
     }
 
-    async fn wait_tab_ready(&self, target_id: &str) -> Result<()> {
+    pub async fn wait_tab_ready(&self, target_id: &str) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let rx = self.state.lock().unwrap().tabs.iter().find(|t| t.target_id == target_id).map(|t| t.ready.subscribe());
@@ -1323,6 +1337,7 @@ fn on_page_event(ev: &Event, tab: &mut Tab) {
                 r.status_text = redirect["statusText"].as_str().unwrap_or_default().into();
                 r.response_headers = redirect["headers"].clone();
                 r.finished = true;
+                r.duration_ms = r.started.map(|s| s.elapsed().as_millis() as u64);
             }
             if p["type"] == "Document" && p["frameId"] == tab.main_frame.as_str() && p.get("redirectResponse").is_none() {
                 tab.requests_nav_start = tab.requests.len();
@@ -1337,6 +1352,7 @@ fn on_page_event(ev: &Event, tab: &mut Tab) {
                 resource_type: p["type"].as_str().unwrap_or("Other").into(),
                 request_headers: req["headers"].clone(),
                 post_data: req["postData"].as_str().map(str::to_string),
+                started: Some(Instant::now()),
                 ..Default::default()
             });
             // Keep memory bounded on long-running pages.
@@ -1362,6 +1378,7 @@ fn on_page_event(ev: &Event, tab: &mut Tab) {
             if let Some(&i) = tab.request_index.get(id) {
                 let r = &mut tab.requests[i];
                 r.finished = true;
+                r.duration_ms = r.started.map(|s| s.elapsed().as_millis() as u64);
                 if ev.method == "Network.loadingFailed" {
                     r.failure = Some(p["errorText"].as_str().unwrap_or("failed").into());
                 }

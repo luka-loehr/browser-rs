@@ -11,13 +11,9 @@ schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-wry = "0.56"
-tao = "0.36"
 base64 = "0.22"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-foundation = "0.3.2"
-objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSGraphics"] }
-objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKSnapshotConfiguration", "block2"] }
-block2 = "0.6.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+regex = "1"
+similar = "2"
+libc = "0.2"

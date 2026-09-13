@@ -440,8 +440,13 @@ impl Browser {
     }
 
     pub async fn wait_for(&self, page: &PageRef, time: Option<f64>, text: Option<&str>, gone: Option<&str>) -> Result<String> {
+        let mut waited = String::new();
         if let Some(t) = time {
-            tokio::time::sleep(Duration::from_secs_f64(t.clamp(0.0, 30.0))).await;
+            // Playwright's unit is seconds, but agents often pass milliseconds: anything above a minute
+            // was meant as ms (waiting 1200 s, capped at 30, silently cost a whole batch 30 s).
+            let secs = if t > 60.0 { t / 1000.0 } else { t };
+            tokio::time::sleep(Duration::from_secs_f64(secs.clamp(0.0, 30.0))).await;
+            waited = if t > 60.0 { format!("Waited {t} ms (time is in seconds; {t} was read as milliseconds)") } else { format!("Waited {t} s") };
         }
         let timeout = self.wait_timeout().as_millis();
         if let Some(t) = gone {
@@ -453,7 +458,7 @@ impl Browser {
         Ok(match (time, text, gone) {
             (_, Some(t), _) => format!("Text \"{t}\" appeared"),
             (_, _, Some(t)) => format!("Text \"{t}\" disappeared"),
-            (Some(s), _, _) => format!("Waited {s}s"),
+            (Some(_), _, _) => waited,
             _ => bail!("pass time, text or textGone"),
         })
     }
@@ -663,7 +668,14 @@ impl Browser {
                 let took = r.duration_ms.map(|d| format!(" ({d} ms)")).unwrap_or_default();
                 out.push(format!("{}. [{}] {} => {status}{took}{}", i - t.requests_nav_start + 1, r.method, r.url, if r.from_route { " (mocked)" } else { "" }));
             }
-            if out.is_empty() { "No network requests".to_string() } else { out.join("\n") }
+            if out.is_empty() {
+                // Say what was looked at, so "nothing failed" cannot be mistaken for "nothing recorded".
+                let since = &t.requests[t.requests_nav_start.min(t.requests.len())..];
+                let failed = since.iter().filter(|r| r.failure.is_some() || r.status.is_some_and(|s| s >= 400)).count();
+                format!("No matching requests ({} recorded since the last page load, {failed} failed)", since.len())
+            } else {
+                out.join("\n")
+            }
         })
     }
 
@@ -966,6 +978,74 @@ pub fn truncate_chars(s: String, max: usize) -> String {
 }
 
 impl Browser {
+    /// Scrolls with trusted wheel events until `target` has at least `count` matches or `text` appears,
+    /// waiting after each scroll for new content (infinite scroll, lazy lists).
+    pub async fn scroll_until(&self, page: &PageRef, target: Option<&str>, count: Option<usize>, text: Option<&str>, max_scrolls: usize) -> Result<String> {
+        if count.is_none() && text.is_none() {
+            bail!("pass target with count, or text");
+        }
+        let sel = target.map(js).unwrap_or_else(|| "null".into());
+        let txt = text.map(js).unwrap_or_else(|| "null".into());
+        let probe = format!(
+            "(() => {{ const n = {sel} ? document.querySelectorAll({sel}).length : 0; const t = {txt} ? document.body.innerText.includes({txt}) : false; \
+             return [n, t, Math.round(scrollY), document.documentElement.scrollHeight, innerWidth, innerHeight]; }})()"
+        );
+        let done = |v: &Value| count.is_some_and(|c| v[0].as_u64().unwrap_or(0) as usize >= c) || v[1] == true;
+        let mut last = self.eval_world(page, &probe).await?;
+        let (cx, cy) = (last[4].as_f64().unwrap_or(1280.0) / 2.0, last[5].as_f64().unwrap_or(800.0) / 2.0);
+        for i in 0..=max_scrolls {
+            if done(&last) {
+                return Ok(format!("Done after {i} scroll(s): {} match(es), scrolled to y={}", last[0], last[2]));
+            }
+            if i == max_scrolls {
+                break;
+            }
+            self.mouse_move(page, cx, cy).await?;
+            self.wheel(page, 0.0, cy * 1.8).await?;
+            let waited = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let v = self.eval_world(page, &probe).await?;
+                let changed = v[0] != last[0] || v[3] != last[3];
+                if changed || done(&v) || waited.elapsed() > Duration::from_millis(1500) {
+                    last = v;
+                    break;
+                }
+            }
+        }
+        bail!("Stopped after {max_scrolls} scrolls: {} match(es), page height {}; the condition was not reached", last[0], last[3])
+    }
+
+    /// Runs JavaScript in the page and captures what it logs, so a documentation example can be run
+    /// as-is and its output read back.
+    pub async fn run_snippet(&self, page: &PageRef, code: &str) -> Result<String> {
+        let wrapped = format!(
+            "(async () => {{ const __logs = []; const __orig = {{}}; \
+             for (const k of ['log', 'info', 'warn', 'error', 'debug']) {{ __orig[k] = console[k]; console[k] = (...a) => {{ \
+               __logs.push((k === 'log' || k === 'info' ? '' : k + ': ') + a.map(x => {{ try {{ return typeof x === 'string' ? x : JSON.stringify(x); }} catch {{ return String(x); }} }}).join(' ')); \
+               __orig[k].apply(console, a); }}; }} \
+             let __result, __error; \
+             try {{ __result = await (async () => {{\n{code}\n}})(); }} catch (e) {{ __error = String((e && e.stack) || e); }} finally {{ Object.assign(console, __orig); }} \
+             let r; try {{ r = __result === undefined ? null : JSON.parse(JSON.stringify(__result)); }} catch {{ r = String(__result); }} \
+             return JSON.stringify({{ logs: __logs, result: r, error: __error || null }}); }})()"
+        );
+        let v = self.evaluate(page, &wrapped, None).await?;
+        let parsed: Value = serde_json::from_str(v.as_str().unwrap_or("null")).unwrap_or(Value::Null);
+        let mut out = Vec::new();
+        let logs = parsed["logs"].as_array().cloned().unwrap_or_default();
+        if logs.is_empty() {
+            out.push("(nothing logged)".to_string());
+        }
+        out.extend(logs.iter().map(|l| l.as_str().unwrap_or_default().to_string()));
+        if !parsed["result"].is_null() {
+            out.push(format!("returned: {}", parsed["result"]));
+        }
+        if let Some(e) = parsed["error"].as_str() {
+            out.push(format!("threw: {}", e.lines().next().unwrap_or(e)));
+        }
+        Ok(out.join("\n"))
+    }
+
     pub fn action_timeout(&self) -> Duration {
         self.overrides.lock().unwrap().timeout.unwrap_or(self.cfg.timeout_action)
     }
@@ -1034,6 +1114,7 @@ impl Browser {
         let status = resp.status();
         let final_url = resp.url().to_string();
         let kind = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        let rate_left = resp.headers().get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()).map(str::to_string);
         let bytes = resp.bytes().await?;
         let Ok(text) = std::str::from_utf8(&bytes).map(str::to_string) else {
             let head = format!("HTTP {status} · {kind} · {} bytes of binary data (not shown)", bytes.len());
@@ -1044,18 +1125,21 @@ impl Browser {
         if final_url != target.as_str() {
             head.push_str(&format!(" · final URL {final_url}"));
         }
+        if let Some(left) = rate_left {
+            head.push_str(&format!(" · rate limit: {left} requests left"));
+        }
         Ok(FetchResult { head, text, json })
     }
 
     /// Loads URLs in parallel background tabs and reads each; the current tab is left alone.
     /// `targets` are (url, function, max_chars) triples, so each page can be read its own way.
-    pub async fn scrape(&self, targets: &[(String, Option<String>, usize)], concurrency: usize, lead: Option<u32>, page_timeout: Duration) -> Result<String> {
+    pub async fn scrape(&self, targets: &[(String, Option<String>, usize)], concurrency: usize, lead: Option<u32>, page_timeout: Duration, archive_fallback: bool) -> Result<String> {
         let cdp = self.cdp().await?;
         let jobs = targets.iter().cloned().enumerate().map(|(i, (url, function, max_chars))| {
             let cdp = cdp.clone();
             async move {
                 let started = Instant::now();
-                let outcome: Result<(Option<i64>, String)> = async {
+                let outcome: Result<(Option<i64>, String, String)> = async {
                     let res = cdp.send("Target.createTarget", json!({ "url": "about:blank", "background": true })).await.map_err(|e| anyhow!(e))?;
                     let target = res["targetId"].as_str().unwrap_or_default().to_string();
                     // One slow site must not hold up the whole call.
@@ -1063,7 +1147,19 @@ impl Browser {
                         self.wait_tab_ready(&target).await?;
                         let session = self.state.lock().unwrap().tabs.iter().find(|t| t.target_id == target).map(|t| t.session_id.clone()).ok_or_else(|| anyhow!("the tab closed"))?;
                         let page = PageRef { cdp: cdp.clone(), session, target_id: target.clone() };
-                        let status = self.navigate(&page, &url).await?;
+                        let mut status = self.navigate(&page, &url).await?;
+                        // A blocked or broken page (403 from bot protection, 404, 5xx) is often still
+                        // readable from the Internet Archive.
+                        let mut via = String::new();
+                        if archive_fallback && status.is_some_and(|s| s >= 400) {
+                            let archived = format!("https://web.archive.org/web/2/{url}");
+                            if let Ok(s) = self.navigate(&page, &archived).await {
+                                if s.is_some_and(|s| s < 400) {
+                                    via = format!(", read via web.archive.org because the site answered HTTP {}", status.unwrap_or(0));
+                                    status = s;
+                                }
+                            }
+                        }
                         let body = match function.as_deref() {
                             Some(f) => match self.evaluate(&page, f, None).await? {
                                 Value::String(s) => s,
@@ -1071,7 +1167,7 @@ impl Browser {
                             },
                             None => self.eval_world(&page, &format!("__bmcp.text({})", json!({ "maxChars": max_chars, "lead": lead }))).await?.as_str().unwrap_or_default().to_string(),
                         };
-                        Ok::<_, anyhow::Error>((status, body))
+                        Ok::<_, anyhow::Error>((status, body, via))
                     })
                     .await
                     .unwrap_or_else(|_| Err(anyhow!("timed out after {} ms (pageTimeout)", page_timeout.as_millis())));
@@ -1087,8 +1183,8 @@ impl Browser {
         Ok(results
             .into_iter()
             .map(|(i, url, max_chars, ms, r)| match r {
-                Ok((status, body)) => format!(
-                    "## {}. {url} (HTTP {}, {ms} ms)\n{}",
+                Ok((status, body, via)) => format!(
+                    "## {}. {url} (HTTP {}, {ms} ms{via})\n{}",
                     i + 1,
                     status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
                     truncate_chars(body, max_chars)

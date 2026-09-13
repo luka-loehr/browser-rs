@@ -5,7 +5,7 @@ binary. It drives the OS's native webview instead — `WKWebView` on macOS, via
 [`wry`](https://github.com/tauri-apps/wry) (the same crate Tauri uses) + `tao` for windowing.
 Since WebKit is already resident system-wide (Safari, Mail, every other app using a webview),
 the marginal cost is just one small window, not a second browser process tree — see
-[BENCHMARKS.md](../BENCHMARKS.md) for real numbers against `@playwright/mcp`.
+[BENCHMARKS.md](../docs/BENCHMARKS.md) for real numbers against `@playwright/mcp`.
 
 **macOS only** for now — Windows (WebView2) and Linux (WebKitGTK) would need their own code
 paths behind `wry`'s cross-platform API; not implemented here yet.

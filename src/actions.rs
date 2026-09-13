@@ -994,7 +994,11 @@ async fn tweet_text(url: &str) -> Option<String> {
     let re = regex::Regex::new(r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/([^/?#]+)/status/(\d+)").ok()?;
     let c = re.captures(url)?;
     let api = format!("https://api.fxtwitter.com/{}/status/{}", &c[1], &c[2]);
-    let resp = tokio::time::timeout(Duration::from_secs(8), reqwest::get(&api)).await.ok()?.ok()?;
+    let client = reqwest::Client::builder().user_agent("browser-rs").build().ok()?;
+    let resp = tokio::time::timeout(Duration::from_secs(8), client.get(&api).send()).await.ok()?.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
     let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
     let t = &v["tweet"];
     let text = t["text"].as_str()?;

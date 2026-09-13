@@ -603,6 +603,8 @@ pub struct LinksParams {
     region: Option<String>,
     /// Include hidden links too (default false)
     include_hidden: Option<bool>,
+    /// Only same-origin pages: no external sites, in-page anchors, or wiki file/meta pages
+    internal: Option<bool>,
     /// Max links to return (default 200)
     limit: Option<u32>,
 }
@@ -657,6 +659,8 @@ pub struct FetchParams {
     fields: Option<Vec<String>>,
     /// JavaScript function applied to the parsed JSON (or text) before returning, e.g. "(d) => d.filter(p => p.merged_at).slice(0, 3).map(p => p.number)"
     transform: Option<String>,
+    /// Fan out: a JavaScript function that receives the first response and returns URLs; those are fetched in parallel and each is shaped by fields/transform. E.g. list -> details in one call: "(d) => d.slice(0, 3).map(p => p.url)"
+    follow: Option<String>,
     /// HTTP method (default GET)
     method: Option<String>,
     /// Request headers
@@ -697,6 +701,32 @@ pub struct ScrapeParams {
     lead: Option<u32>,
     /// Give up on a page after this many ms and report it as timed out (default 15000)
     page_timeout: Option<u64>,
+    /// When a site answers HTTP 4xx/5xx (bot protection, removed page), read the web.archive.org copy instead (default true)
+    archive_fallback: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrollUntilParams {
+    /// CSS selector to count, used with count (e.g. ".post")
+    target: Option<String>,
+    /// Stop once target has at least this many matches
+    count: Option<usize>,
+    /// Or stop once this text appears on the page
+    text: Option<String>,
+    /// Give up after this many scrolls (default 20)
+    max_scrolls: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunSnippetParams {
+    /// JavaScript to run; top-level await works and console output is captured
+    code: Option<String>,
+    /// Or run a code block from the page: a selector such as "pre" or "pre code"
+    #[serde(alias = "ref")]
+    target: Option<String>,
+    /// Which matching code block to run (default 0, the first)
+    index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -853,6 +883,8 @@ impl BrowserServer {
             "browser_set_mode" => self.set_mode(p(args)?).await,
             "browser_links" => self.links(p(args)?).await,
             "browser_read" => self.read(p(args)?).await,
+            "browser_scroll_until" => self.scroll_until(p(args)?).await,
+            "browser_run_snippet" => self.run_snippet(p(args)?).await,
             "browser_text" => self.text(p(args)?).await,
             "browser_table" => self.table(p(args)?).await,
             "browser_extract" => self.extract(p(args)?).await,
@@ -1130,7 +1162,7 @@ impl BrowserServer {
 
     async fn links(&self, p: LinksParams) -> Result<Reply> {
         let page = self.browser.page().await?;
-        let opts = json!({ "scope": p.scope, "filter": p.filter, "region": p.region, "visibleOnly": !p.include_hidden.unwrap_or(false), "limit": p.limit });
+        let opts = json!({ "scope": p.scope, "filter": p.filter, "region": p.region, "visibleOnly": !p.include_hidden.unwrap_or(false), "internal": p.internal, "limit": p.limit });
         let links = self.browser.eval_world(&page, &format!("__bmcp.links({opts})")).await?;
         let url = self.browser.tab_read(&page, |t| t.url.clone())?;
         let origin = url.split('/').take(3).collect::<Vec<_>>().join("/");
@@ -1187,6 +1219,33 @@ impl BrowserServer {
         }
         let max = p.max_chars.unwrap_or(20_000);
         let method = p.method.clone().unwrap_or_else(|| "GET".into());
+        if let Some(follow) = &p.follow {
+            if urls.len() != 1 {
+                bail!("follow works with a single url");
+            }
+            let first = self.browser.fetch_in_page(&page, &urls[0], &method, &headers, p.body.as_deref()).await?;
+            let input = match &first.json {
+                Some(v) => v.to_string(),
+                None => serde_json::to_string(&first.text)?,
+            };
+            let next = self.browser.eval_world(&page, &format!("({follow})({input})")).await?;
+            let next: Vec<String> = next.as_array().map(|a| a.iter().filter_map(|u| u.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if next.is_empty() {
+                bail!("follow returned no URLs (it must return an array of strings)");
+            }
+            let fetched = futures_util::future::join_all(next.iter().map(|u| self.browser.fetch_in_page(&page, u, "GET", &headers, None))).await;
+            let mut sections = vec![format!("{} → followed {} URL(s)", first.head, next.len())];
+            for (u, r) in next.iter().zip(fetched) {
+                sections.push(match r {
+                    Ok(f) => {
+                        let body = self.shape_body(&page, &f, p.transform.as_deref(), p.fields.as_deref()).await?;
+                        format!("## {u}\n{}\n{}", f.head, crate::actions::truncate_chars(body, max))
+                    }
+                    Err(e) => format!("## {u}\nfailed: {e:#}"),
+                });
+            }
+            return Ok(Reply::raw(sections.join("\n\n")));
+        }
         let results = futures_util::future::join_all(urls.iter().map(|u| self.browser.fetch_in_page(&page, u, &method, &headers, p.body.as_deref()))).await;
         let mut sections = Vec::new();
         for (u, r) in urls.iter().zip(results) {
@@ -1236,8 +1295,37 @@ impl BrowserServer {
                 ScrapeTarget::Spec { url, function, max_chars } => (url, function.or_else(|| shared.clone()), max_chars.unwrap_or(default_max)),
             })
             .collect();
-        let text = self.browser.scrape(&targets, p.concurrency.unwrap_or(4), p.lead, Duration::from_millis(p.page_timeout.unwrap_or(15_000))).await?;
+        let text = self
+            .browser
+            .scrape(&targets, p.concurrency.unwrap_or(4), p.lead, Duration::from_millis(p.page_timeout.unwrap_or(15_000)), p.archive_fallback.unwrap_or(true))
+            .await?;
         Ok(Reply::raw(text))
+    }
+
+    async fn scroll_until(&self, p: ScrollUntilParams) -> Result<Reply> {
+        let page = self.browser.page().await?;
+        let msg = self.browser.scroll_until(&page, p.target.as_deref(), p.count, p.text.as_deref(), p.max_scrolls.unwrap_or(20)).await?;
+        Ok(Reply::action(msg))
+    }
+
+    async fn run_snippet(&self, p: RunSnippetParams) -> Result<Reply> {
+        let page = self.browser.page().await?;
+        let code = match (&p.code, &p.target) {
+            (Some(code), _) => code.clone(),
+            (None, Some(target)) => {
+                // innerText keeps the code's line breaks (a collapsed line would turn the rest into a comment).
+                let blocks = self.browser.eval_world(&page, &format!("__bmcp.read({}, 'innerText', true)", crate::actions::js(target))).await?;
+                let index = p.index.unwrap_or(0);
+                let blocks = blocks.as_array().cloned().unwrap_or_default();
+                blocks
+                    .get(index)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("{target} has {} code block(s); index {index} does not exist", blocks.len()))?
+            }
+            (None, None) => bail!("pass code, or target to run a code block from the page"),
+        };
+        Ok(Reply::text(self.browser.run_snippet(&page, &code).await?))
     }
 
     async fn read(&self, p: ReadParams) -> Result<Reply> {
@@ -1422,7 +1510,7 @@ impl BrowserServer {
     }
 
     #[tool(
-        description = "Run many browser tools in one call, in order: act, wait and read without round trips (e.g. navigate, type, click, wait_for {url}, read {target, equals}). Returns each step's result and one snapshot at the end (snapshot:\"none\" to skip it). Targets: ref, CSS (first visible match; \"a >> b\" enters iframes/shadow roots), text=…, role=…[name=\"…\"], link=<regex>"
+        description = "Run many browser tools in one call, in order: act, wait and read without round trips (e.g. navigate, type, click, wait_for {url}, read {target, equals}). Returns each step's result with its own ms, and one snapshot at the end (snapshot:\"none\" to skip it). Targets: ref, CSS (first visible match; \"a >> b\" enters iframes/shadow roots), text=…, role=…[name=\"…\"], link=<regex>, href=<url>"
     )]
     async fn browser_batch(&self, Parameters(p): Parameters<BatchParams>) -> R {
         let stop = p.stop_on_error.unwrap_or(true);
@@ -1432,14 +1520,17 @@ impl BrowserServer {
         for (i, step) in p.steps.into_iter().enumerate() {
             let step_timeout = step.arguments.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).or(batch_timeout);
             self.browser.overrides.lock().unwrap().timeout = step_timeout;
-            match self.dispatch(&step.tool, step.arguments).await {
+            let started = std::time::Instant::now();
+            let outcome = self.dispatch(&step.tool, step.arguments).await;
+            let ms = started.elapsed().as_millis();
+            match outcome {
                 Ok(r) => {
-                    combined.result.push(format!("{}. {}: {}", i + 1, step.tool, r.result.join(" ").trim()));
+                    combined.result.push(format!("{}. {} ({ms} ms): {}", i + 1, step.tool, r.result.join(" ").trim()));
                     combined.snapshot |= r.snapshot;
                     combined.images.extend(r.images);
                 }
                 Err(e) => {
-                    combined.result.push(format!("{}. {}: ERROR {e:#}", i + 1, step.tool));
+                    combined.result.push(format!("{}. {} ({ms} ms): ERROR {e:#}", i + 1, step.tool));
                     failed = true;
                     if stop {
                         break;
@@ -1451,7 +1542,8 @@ impl BrowserServer {
         combined.snapshot = true;
         if combined.error {
             // Still show where the page ended up, so the agent can recover without another call.
-            let mut r = self.browser.finish(Reply { error: false, ..combined }).await;
+            // A short snapshot is enough to orient; a failed step must not flood the context.
+            let mut r = self.browser.finish(Reply { error: false, snapshot_max: Some(3_000), ..combined }).await;
             r.is_error = Some(true);
             return Ok(r);
         }
@@ -1473,6 +1565,16 @@ impl BrowserServer {
     #[tool(description = "Read one value from the page: an element's text, value, checked state, HTML or attribute, or all CSS matches as a JSON array (searching inside open shadow roots too, e.g. code blocks). With equals/contains it becomes an assertion that fails the call or batch step")]
     async fn browser_read(&self, Parameters(p): Parameters<ReadParams>) -> R {
         self.respond(self.read(p).await).await
+    }
+
+    #[tool(description = "Scroll with real wheel events until a CSS selector has at least N matches or a text appears, waiting for new content after each scroll (infinite scroll, lazy lists). Returns the match count")]
+    async fn browser_scroll_until(&self, Parameters(p): Parameters<ScrollUntilParams>) -> R {
+        self.respond(self.scroll_until(p).await).await
+    }
+
+    #[tool(description = "Run JavaScript in the page and get what it logs plus its return value, or run a code block from the page itself (target \"pre\", index) exactly as written, e.g. a documentation example")]
+    async fn browser_run_snippet(&self, Parameters(p): Parameters<RunSnippetParams>) -> R {
+        self.respond(self.run_snippet(p).await).await
     }
 
     #[tool(description = "Read a table as TSV (default), Markdown or JSON")]
@@ -2023,12 +2125,16 @@ impl ServerHandler for BrowserServer {
             .with_server_info(Implementation::new("browser-rs", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Browser automation on a bundled Chromium, with @playwright/mcp's tool names plus agent-first tools. Headless. \
-                 Fastest way to work: (1) read with browser_text (Markdown), browser_links, browser_table, browser_extract or \
-                 browser_fetch instead of snapshots; (2) act with CSS/text selectors or refs, several steps per browser_batch; \
-                 (3) pass snapshot:\"none\" on actions when you do not need to see the page (\"main\" for main content only, \
-                 default \"diff\" shows changed lines); (4) use browser_scrape to read many URLs in parallel. browser_evaluate \
-                 awaits async functions. Every reply ends with elapsed_ms. When a human must act (log in, 2FA, CAPTCHA, \
-                 payment), call browser_handoff: they get a live view of the same page, nothing reloads.",
+                 Fastest way to work: (1) read with browser_text (Markdown; lead:1 = first paragraph, heading = one section), \
+                 browser_links (internal:true, region:\"main\"), browser_table, browser_extract, browser_read or browser_fetch \
+                 (fields, transform, follow) instead of snapshots; (2) act with targets that need no snapshot: CSS (first \
+                 visible match, \"a >> b\" enters iframes and shadow roots), text=…, role=button[name=\"…\"], link=<regex>, \
+                 href=<url>; put dependent steps in one browser_batch (each step reports its ms); (3) pass snapshot:\"none\" on \
+                 actions you do not need to see (\"main\" = main content, default \"diff\" = changed lines); (4) browser_scrape \
+                 reads many URLs in parallel, browser_scroll_until loads infinite lists, browser_run_snippet runs code and \
+                 captures console output. browser_type replaces a field's value. Every reply ends with elapsed_ms. When a \
+                 human must act (log in, 2FA, CAPTCHA, payment), call browser_handoff: a live view of the same page opens in \
+                 their browser, nothing reloads.",
             )
     }
 }

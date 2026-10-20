@@ -131,8 +131,7 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
         let chunk = chunk?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
         done += chunk.len() as u64;
-        if total > 0 {
-            let pct = done * 100 / total;
+        if let Some(pct) = (done * 100).checked_div(total) {
             if pct >= last_pct + 10 {
                 last_pct = pct;
                 eprintln!("browser-rs: {pct}% of {} MB", total / 1_000_000);

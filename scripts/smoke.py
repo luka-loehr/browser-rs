@@ -113,6 +113,14 @@ def t_nav(c):
     dt, text, err = c.call("browser_navigate", {"url": BASE + "/redirect", "snapshot": "none"})
     dt2, text2, _ = c.call("browser_text", {})
     check("script redirect followed", not err and "Arrived." in text2, text + "\n" + text2)
+    # A redirect can replace the document before the server's wait loop sees it commit.
+    bad = []
+    for _ in range(10):
+        c.call("browser_navigate", {"url": BASE + "/frame-b", "snapshot": "none"})
+        dt, text, err = c.call("browser_navigate", {"url": BASE + "/redirect", "snapshot": "none"})
+        if err:
+            bad.append(text)
+    check("script redirect never times out (10 runs)", not bad, "\n".join(bad))
     dt, text, err = c.call("browser_navigate", {"url": "https://example.com/", "snapshot": "none"})
     check("real page navigates with status", not err and "HTTP 200" in text, text)
 
@@ -167,7 +175,7 @@ if __name__ == "__main__":
     if args[:1] == ["--bin"]:
         binary, args = args[1], args[2:]
     names = args or list(TESTS)
-    c = Client([binary, "--isolated", *extra])
+    c = Client([binary, "--isolated", "--timeout-navigation", "15000", *extra])
     try:
         for n in names:
             TESTS[n](c)

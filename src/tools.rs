@@ -7,7 +7,7 @@ use crate::response::Reply;
 use anyhow::{anyhow, bail, Result};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use serde::Deserialize;
@@ -628,6 +628,19 @@ pub struct TextParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct FramesParams {
+    /// Only this frame and the frames inside it: its name or id, its path ("top > left"), its number in the list, or part of its URL
+    frame: Option<String>,
+    /// Keep links as [text](url) (default false)
+    links: Option<bool>,
+    /// Also list hidden and zero-size frames, such as trackers (default false)
+    include_hidden: Option<bool>,
+    /// Max characters to return (default 20000)
+    max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct TableParams {
     /// The table (or an element containing it) as ref or selector
     #[serde(alias = "ref")]
@@ -907,6 +920,7 @@ impl BrowserServer {
             "browser_search" => self.search(p(args)?).await,
             "browser_check" => self.check(p(args)?).await,
             "browser_text" => self.text(p(args)?).await,
+            "browser_frames" => self.frames(p(args)?).await,
             "browser_table" => self.table(p(args)?).await,
             "browser_extract" => self.extract(p(args)?).await,
             "browser_fetch" => self.fetch(p(args)?).await,
@@ -1210,6 +1224,62 @@ impl BrowserServer {
         let opts = json!({ "target": p.target, "heading": p.heading, "lead": p.lead, "links": p.links, "maxChars": p.max_chars });
         let text = self.browser.eval_world(&page, &format!("__bmcp.text({opts})")).await?;
         Ok(Reply::raw(text.as_str().unwrap_or_default()))
+    }
+
+    async fn frames(&self, p: FramesParams) -> Result<Reply> {
+        let page = self.browser.page().await?;
+        let all = self.browser.frames(&page, p.links.unwrap_or(false), p.include_hidden.unwrap_or(false)).await?;
+        let path = |f: &Value| f["path"].as_str().unwrap_or_default().to_string();
+        let picked: Vec<usize> = match p.frame.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            None => (0..all.len()).collect(),
+            Some(q) => {
+                // Exact matches (number, path, last path segment, name or id) win over URL substrings.
+                let exact = |i: usize, f: &Value| {
+                    let fp = path(f);
+                    (i + 1).to_string() == q || fp.eq_ignore_ascii_case(q) || fp.rsplit(" > ").next().is_some_and(|l| l.eq_ignore_ascii_case(q)) || f["name"] == q
+                };
+                let mut roots: Vec<String> = all.iter().enumerate().filter(|(i, f)| exact(*i, f)).map(|(_, f)| path(f)).collect();
+                if roots.is_empty() {
+                    roots = all.iter().filter(|f| f["url"].as_str().is_some_and(|u| u.contains(q))).map(path).collect();
+                }
+                if roots.is_empty() {
+                    let list: Vec<String> = all.iter().enumerate().map(|(i, f)| format!("[{}] {}", i + 1, path(f))).collect();
+                    bail!("No frame matches \"{q}\". Frames on this page: {}", list.join(" | "));
+                }
+                // A frame comes with the frames inside it.
+                (0..all.len()).filter(|&i| roots.iter().any(|r| { let fp = path(&all[i]); fp == *r || fp.starts_with(&format!("{r} > ")) })).collect()
+            }
+        };
+        let mut out = String::new();
+        if p.frame.is_none() {
+            out.push_str(&match all.len() {
+                1 => "No frames on this page; browser_text reads it.\n".to_string(),
+                n => format!("{} frame{}, after the main document; same-origin ones can be entered with their target, e.g. <target> >> button\n", n - 1, if n == 2 { "" } else { "s" }),
+            });
+        }
+        for i in picked {
+            let f = &all[i];
+            let mut head = format!("\n[{}] {} · {}", i + 1, path(f), f["url"].as_str().unwrap_or_default());
+            if let Some(t) = f["title"].as_str().filter(|t| !t.is_empty()) {
+                head.push_str(&format!(" · title: {t}"));
+            }
+            if let Some(t) = f["target"].as_str().filter(|t| !t.is_empty()) {
+                head.push_str(&format!(" · target: {t}"));
+            }
+            if f["crossOrigin"] == true || f["cross"].is_number() {
+                head.push_str(" · cross-origin, selectors cannot enter it");
+            }
+            if f["visible"] == false {
+                head.push_str(" · hidden");
+            }
+            let body = match (f["error"].as_str(), f["text"].as_str().map(str::trim).filter(|t| !t.is_empty())) {
+                (Some(e), _) => format!("(not readable: {e})"),
+                (None, Some(t)) => t.to_string(),
+                (None, None) => "(no text of its own)".to_string(),
+            };
+            out.push_str(&format!("{head}\n{body}\n"));
+        }
+        Ok(Reply::raw(crate::actions::truncate_chars(out.trim().to_string(), p.max_chars.unwrap_or(20000))))
     }
 
     async fn table(&self, p: TableParams) -> Result<Reply> {
@@ -1638,6 +1708,11 @@ impl BrowserServer {
     #[tool(description = "Read the page as Markdown: the article or main content by default (with title, URL, author, published date, description; site chrome, share boxes and infoboxes left out), one section by heading, one element, or just the first paragraphs with lead. Use it for reading instead of snapshots or custom JavaScript")]
     async fn browser_text(&self, Parameters(p): Parameters<TextParams>) -> R {
         self.respond(self.text(p).await).await
+    }
+
+    #[tool(description = "Read every frame of the page as Markdown, one entry per frame: framesets and iframes, nested and cross-origin ones (embedded widgets, payment or video frames) included. Each entry has the frame's path, URL and, for same-origin frames, a target prefix such as frame[name=\"top\"] >> frame[name=\"left\"] that clicks and reads continue with (<target> >> button). frame picks one by name, path, number or URL")]
+    async fn browser_frames(&self, Parameters(p): Parameters<FramesParams>) -> R {
+        self.respond(self.frames(p).await).await
     }
 
     #[tool(description = "Read one value from the page: an element's text, value, checked state, HTML or attribute, or all CSS matches as a JSON array (searching inside open shadow roots too, e.g. code blocks). With equals/contains it becomes an assertion that fails the call or batch step")]
@@ -2208,8 +2283,8 @@ impl ServerHandler for BrowserServer {
         response
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("browser-rs", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Browser automation on a bundled Chromium, with @playwright/mcp's tool names plus agent-first tools. Headless. \
@@ -2221,7 +2296,7 @@ impl ServerHandler for BrowserServer {
                  actions you do not need to see (\"main\" = main content, default \"diff\" = changed lines); (4) browser_scrape \
                  reads many URLs in parallel, browser_search uses the site's own search, browser_scroll_until loads \
                  infinite lists, browser_run_snippet runs code or a page code block and captures its output, browser_check \
-                 sets checkboxes. browser_type replaces a field's value. Every reply ends with elapsed_ms. When a \
+                 sets checkboxes, browser_frames reads every frame including cross-origin iframes. browser_type replaces a field's value. Every reply ends with elapsed_ms. When a \
                  human must act (log in, 2FA, CAPTCHA, payment), call browser_handoff: a live view of the same page opens in \
                  their browser, nothing reloads.",
             )

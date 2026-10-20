@@ -3,6 +3,7 @@
 //! the capture/storage/network features built on plain CDP domains.
 
 use crate::browser::{Browser, PageRef, Route, Video};
+use crate::cdp::Cdp;
 use crate::keys;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -1047,6 +1048,122 @@ pub fn truncate_chars(s: String, max: usize) -> String {
     }
     let total = s.chars().count();
     format!("{}\n… truncated at {max} of {total} chars", s.chars().take(max).collect::<String>())
+}
+
+impl Browser {
+    /// Every frame of the page with its own text, main document first. Same-origin frames are
+    /// read inside the page; cross-origin ones through an isolated world of their own.
+    pub async fn frames(&self, page: &PageRef, links: bool, include_hidden: bool) -> Result<Vec<Value>> {
+        let opts = json!({ "links": links, "includeHidden": include_hidden });
+        let list = self.eval_world(page, &format!("__bmcp.frames({opts})")).await?;
+        let mut out = Vec::new();
+        for entry in list.as_array().cloned().unwrap_or_default() {
+            let Some(i) = entry["cross"].as_u64() else {
+                out.push(entry);
+                continue;
+            };
+            let read = async {
+                let handle = self.eval_world_handle(page, &format!("__bmcp.crossFrame({i})")).await?;
+                let frame_id = frame_id_of(&page.cdp, &page.session, &handle).await?;
+                read_cross_frame(&page.cdp, &page.session, &frame_id, &entry, links, include_hidden, 0).await
+            };
+            match read.await {
+                Ok(entries) => out.extend(entries),
+                Err(e) => out.push(with_error(entry, e)),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The frame id behind a frame element; for an out-of-process iframe it is also its target id.
+async fn frame_id_of(cdp: &Cdp, session: &str, object_id: &str) -> Result<String> {
+    let node = cdp.send_session(session, "DOM.describeNode", json!({ "objectId": object_id })).await.map_err(|e| anyhow!(e));
+    let _ = cdp.send_session(session, "Runtime.releaseObject", json!({ "objectId": object_id })).await;
+    node?["node"]["frameId"].as_str().map(str::to_string).ok_or_else(|| anyhow!("the frame has no document yet"))
+}
+
+fn with_error(mut entry: Value, e: anyhow::Error) -> Value {
+    entry["error"] = json!(e.to_string());
+    entry
+}
+
+async fn eval_in(cdp: &Cdp, session: &str, ctx: i64, expr: &str, by_value: bool) -> Result<Value> {
+    let res = cdp
+        .send_session(session, "Runtime.evaluate", json!({ "expression": expr, "contextId": ctx, "returnByValue": by_value }))
+        .await
+        .map_err(|e| anyhow!(e))?;
+    if let Some(ex) = res.get("exceptionDetails") {
+        let msg = ex["exception"]["description"].as_str().or_else(|| ex["text"].as_str()).unwrap_or("JavaScript exception");
+        bail!("{}", msg.lines().next().unwrap_or(msg).trim_start_matches("Error: "));
+    }
+    Ok(res)
+}
+
+/// Reads a cross-origin frame and the frames inside it through an isolated world of its own: in
+/// the parent's session when the frame shares its renderer, otherwise through a session attached
+/// to the frame's out-of-process iframe target, detached again afterwards.
+fn read_cross_frame<'a>(
+    cdp: &'a Cdp,
+    session: &'a str,
+    frame_id: &'a str,
+    entry: &'a Value,
+    links: bool,
+    include_hidden: bool,
+    depth: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Value>>> + Send + 'a>> {
+    Box::pin(async move {
+        let world = json!({ "frameId": frame_id, "worldName": crate::browser::WORLD, "grantUniveralAccess": true });
+        let (sess, ctx, attached) = match cdp.send_session(session, "Page.createIsolatedWorld", world.clone()).await {
+            Ok(r) => (session.to_string(), r["executionContextId"].as_i64(), false),
+            Err(_) => {
+                let r = cdp
+                    .send("Target.attachToTarget", json!({ "targetId": frame_id, "flatten": true }))
+                    .await
+                    .map_err(|e| anyhow!("cannot attach to the frame: {e}"))?;
+                let s = r["sessionId"].as_str().ok_or_else(|| anyhow!("no session for the frame"))?.to_string();
+                let w = cdp.send_session(&s, "Page.createIsolatedWorld", world).await;
+                (s, w.ok().and_then(|r| r["executionContextId"].as_i64()), true)
+            }
+        };
+        let result = async {
+            let ctx = ctx.ok_or_else(|| anyhow!("could not open the frame's document"))?;
+            eval_in(cdp, &sess, ctx, crate::browser::INJECTED, false).await?;
+            let opts = json!({ "links": links, "includeHidden": include_hidden, "path": entry["path"], "name": entry["name"] });
+            let list = eval_in(cdp, &sess, ctx, &format!("__bmcp.frames({opts})"), true).await?;
+            let mut out = Vec::new();
+            for mut f in list["result"]["value"].as_array().cloned().unwrap_or_default() {
+                f["crossOrigin"] = json!(true);
+                if out.is_empty() {
+                    f["visible"] = entry["visible"].clone();
+                }
+                let Some(i) = f["cross"].as_u64() else {
+                    out.push(f);
+                    continue;
+                };
+                if depth >= 3 {
+                    out.push(with_error(f, anyhow!("cross-origin frames nested too deep")));
+                    continue;
+                }
+                let nested = async {
+                    let h = eval_in(cdp, &sess, ctx, &format!("__bmcp.crossFrame({i})"), false).await?;
+                    let id = h["result"]["objectId"].as_str().ok_or_else(|| anyhow!("frame element is gone"))?.to_string();
+                    let fid = frame_id_of(cdp, &sess, &id).await?;
+                    read_cross_frame(cdp, &sess, &fid, &f, links, include_hidden, depth + 1).await
+                };
+                match nested.await {
+                    Ok(entries) => out.extend(entries),
+                    Err(e) => out.push(with_error(f, e)),
+                }
+            }
+            Ok(out)
+        }
+        .await;
+        if attached {
+            let _ = cdp.send("Target.detachFromTarget", json!({ "sessionId": sess })).await;
+        }
+        result
+    })
 }
 
 impl Browser {

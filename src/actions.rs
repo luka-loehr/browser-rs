@@ -86,6 +86,7 @@ impl Browser {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn click_xy(&self, page: &PageRef, x: f64, y: f64, button: &str, count: i64, modifiers: i64, delay_ms: u64) -> Result<()> {
         self.mouse_move(page, x, y).await?;
         for i in 1..=count.max(1) {

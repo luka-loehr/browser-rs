@@ -30,7 +30,7 @@
     CAPTION: 'caption', CODE: 'code', DD: 'definition', DEL: 'deletion', DETAILS: 'group',
     DIALOG: 'dialog', DT: 'term', EM: 'emphasis', FIELDSET: 'group', FIGURE: 'figure',
     H1: 'heading', H2: 'heading', H3: 'heading', H4: 'heading', H5: 'heading', H6: 'heading',
-    HR: 'separator', IFRAME: 'iframe', INS: 'insertion', LI: 'listitem', MAIN: 'main', MARK: 'mark',
+    FRAME: 'iframe', HR: 'separator', IFRAME: 'iframe', INS: 'insertion', LI: 'listitem', MAIN: 'main', MARK: 'mark',
     MATH: 'math', MENU: 'list', METER: 'meter', NAV: 'navigation', OL: 'list', OPTGROUP: 'group',
     OPTION: 'option', OUTPUT: 'status', P: 'paragraph', PRE: 'generic', PROGRESS: 'progressbar',
     STRONG: 'strong', SUB: 'subscript', SUP: 'superscript', SUMMARY: 'button', SVG: 'img',
@@ -195,7 +195,7 @@
     if (node.nodeType === Node.ELEMENT_NODE) {
       if (node.tagName === 'SLOT') return node.assignedNodes({ flatten: true });
       if (node.shadowRoot) return node.shadowRoot.childNodes;
-      if (node.tagName === 'IFRAME') {
+      if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
         try { const d = node.contentDocument; return d && d.body ? [d.body] : []; } catch { return []; }
       }
     }
@@ -808,7 +808,8 @@
         else if (t === 'HR') out.push('\n---');
         else if (t === 'IMG') continue;
         else if (t === 'IFRAME' || t === 'FRAME') {
-          // Same-origin frames are part of what a reader sees; cross-origin ones cannot be read.
+          // Same-origin frames are part of what a reader sees; cross-origin ones cannot be read here.
+          if (opts.noFrames) continue;
           try { const d = c.contentDocument; if (d && d.body) block({ childNodes: [d.body] }, depth); } catch {}
         }
         else block(c, depth);
@@ -820,6 +821,56 @@
     }
     return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
+
+  // ---------------------------------------------------------------- frames
+
+  // Cross-origin frame elements found by the last frames() call; the server reads them over CDP.
+  let crossFrames = [];
+
+  // This document and every <frame>/<iframe> below it, depth first: the path of frame names
+  // ("top > left"), a target prefix that enters the frame ("frame[name=top] >> frame[name=left]"),
+  // the URL, the title and the frame's own text as Markdown (nested frames are entries of their own).
+  // Cross-origin frames come back unread, with an index for crossFrame().
+  function frames(opts = {}) {
+    crossFrames = [];
+    // A frame keeps its chrome (in a frameset the navigation often is a frame); the main document
+    // is read like browser_text reads it.
+    const md = d => toMarkdown([d.body || d.documentElement], { links: opts.links, keepChrome: true, noFrames: true });
+    const own = opts.path ? md(document) : toMarkdown([contentRoot()], { links: opts.links, noFrames: true });
+    const out = [{ path: opts.path || 'main', name: opts.name || '', target: opts.path ? null : '', url: location.href, title: document.title, text: own, visible: true }];
+    const selectorFor = (el, i) => {
+      const tag = el.tagName.toLowerCase();
+      const name = el.getAttribute('name');
+      if (name) return `${tag}[name=${JSON.stringify(name)}]`;
+      if (el.id) return `${tag}#${CSS.escape(el.id)}`;
+      if (el.getAttribute('src')) return `${tag}[src=${JSON.stringify(el.getAttribute('src'))}]`;
+      return `${tag}:nth-of-type(${i})`;
+    };
+    function walk(doc, path, target, depth) {
+      const els = [...allElements(doc)].filter(e => e.tagName === 'IFRAME' || e.tagName === 'FRAME');
+      els.forEach((el, k) => {
+        const visible = isVisible(el);
+        if (!visible && !opts.includeHidden) return;
+        const name = el.getAttribute('name') || el.id || el.getAttribute('title') || '';
+        const p = (path ? path + ' > ' : '') + (name || `${el.tagName.toLowerCase()} ${k + 1}`);
+        const nth = [...el.parentNode.children].filter(c => c.tagName === el.tagName).indexOf(el) + 1;
+        const t = target === null ? null : (target ? target + ' >> ' : '') + selectorFor(el, nth);
+        let d = null;
+        try { d = el.contentDocument; } catch {}
+        if (d) {
+          out.push({ path: p, name, target: t, url: d.location.href, title: d.title, text: md(d), visible });
+          if (depth < 10) walk(d, p, t, depth + 1);
+        } else {
+          crossFrames.push(el);
+          out.push({ path: p, name, target: null, url: el.src || attrOf(el, 'src'), title: el.getAttribute('title') || '', cross: crossFrames.length - 1, visible });
+        }
+      });
+    }
+    walk(document, opts.path || '', opts.path ? null : '', 0);
+    return out;
+  }
+
+  const crossFrame = i => crossFrames[i];
 
   // Region of an element by its own role or classes only (ancestors are handled by the walk itself).
   function regionOfSelf(el) {
@@ -1116,6 +1167,6 @@
     snapshot, resolve, describe, prepare, beginFill, focusForTyping, selectOptions, checkedState,
     waitForText, generateLocator, isRoleVisible, highlight, removeHighlight,
     setRecording, roleOf, nameOf, isVisible, pageText, links, text, tableText, extract, waitForSelector, read,
-    codeBlocks, searchInput, searchOpener, searchResults,
+    codeBlocks, searchInput, searchOpener, searchResults, frames, crossFrame,
   };
 })();

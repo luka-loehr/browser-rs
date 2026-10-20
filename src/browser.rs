@@ -107,6 +107,9 @@ pub struct Tab {
     pub main_frame: String,
     pub world_ctx: Option<i64>,
     pub loader_id: String,
+    /// Loader ids of the last main-frame documents, newest last: a script redirect can replace a
+    /// navigation's document before the navigation's wait loop looks at the tab.
+    pub committed_loaders: Vec<String>,
     pub loading: watch::Sender<bool>,
     /// When the main frame fired DOMContentLoaded during the current load.
     pub dom_ready_at: Option<Instant>,
@@ -528,7 +531,7 @@ impl Browser {
             let done = {
                 let st = self.state.lock().unwrap();
                 st.tabs.iter().find(|t| t.session_id == page.session).map(|t| {
-                    committed |= t.loader_id == loader;
+                    committed |= t.loader_id == loader || t.committed_loaders.contains(&loader);
                     // Done at the load event, or once the DOM has been ready for a short grace
                     // period: slow images, ads and trackers must not hold a navigation for a minute.
                     committed && (!*t.loading.borrow() || t.dom_ready_at.is_some_and(|d| d.elapsed() >= DOM_READY_GRACE))
@@ -1072,6 +1075,7 @@ fn on_event(ev: &Event, state: &Arc<Mutex<State>>, cdp: Option<Arc<Cdp>>, rt: &t
                     main_frame: String::new(),
                     world_ctx: None,
                     loader_id: String::new(),
+                    committed_loaders: Vec::new(),
                     loading: watch::channel(false).0,
                     dom_ready_at: None,
                     ready: watch::channel(false).0,
@@ -1283,6 +1287,10 @@ fn on_page_event(ev: &Event, tab: &mut Tab) {
             tab.main_frame = f["id"].as_str().unwrap_or_default().into();
             tab.url = f["url"].as_str().unwrap_or_default().to_string() + f["urlFragment"].as_str().unwrap_or("");
             tab.loader_id = f["loaderId"].as_str().unwrap_or_default().into();
+            if tab.committed_loaders.len() >= 8 {
+                tab.committed_loaders.remove(0);
+            }
+            tab.committed_loaders.push(tab.loader_id.clone());
             tab.console_nav_start = tab.console.len();
             tab.console_reported = tab.console.len();
             tab.last_snapshot = None;

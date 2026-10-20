@@ -202,7 +202,7 @@ impl Browser {
                     let mut st = self.state.lock().unwrap();
                     let tabs = st.tabs.len();
                     let current = st.current;
-                    let notices: Vec<String> = st.notices.drain(..).collect();
+                    let notices: Vec<String> = std::mem::take(&mut st.notices);
                     let Some(tab) = st.tabs.iter_mut().find(|t| t.session_id == page.session) else {
                         return CallToolResult::success(vec![ContentBlock::text(out)]);
                     };

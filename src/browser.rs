@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 pub const WORLD: &str = "__bmcp";
+/// How long a navigation waits for the load event after DOMContentLoaded.
+const DOM_READY_GRACE: Duration = Duration::from_millis(1500);
 pub const INJECTED: &str = include_str!("injected.js");
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,8 @@ pub struct Tab {
     pub world_ctx: Option<i64>,
     pub loader_id: String,
     pub loading: watch::Sender<bool>,
+    /// When the main frame fired DOMContentLoaded during the current load.
+    pub dom_ready_at: Option<Instant>,
     pub ready: watch::Sender<bool>,
     pub console: Vec<ConsoleMsg>,
     pub console_nav_start: usize,
@@ -494,7 +498,7 @@ impl Browser {
 
     // ------------------------------------------------------------------ navigation
 
-    /// Navigates and waits for the load; returns the main document's HTTP status when there is one.
+    /// Navigates and waits for the load (or DOMContentLoaded plus DOM_READY_GRACE); returns the main document's HTTP status when there is one.
     pub async fn navigate(&self, page: &PageRef, url: &str) -> Result<Option<i64>> {
         let url = normalize_url(url);
         self.check_origin(&url)?;
@@ -517,14 +521,22 @@ impl Browser {
             return Ok(None); // same-document navigation
         };
         let deadline = Instant::now() + self.cfg.timeout_navigation;
+        // Once our document committed, a script or meta redirect that replaces it is followed:
+        // the wait then ends when whatever document the tab ends up on is loaded.
+        let mut committed = false;
         loop {
             let done = {
                 let st = self.state.lock().unwrap();
-                st.tabs.iter().find(|t| t.session_id == page.session).map(|t| t.loader_id == loader && !*t.loading.borrow())
+                st.tabs.iter().find(|t| t.session_id == page.session).map(|t| {
+                    committed |= t.loader_id == loader;
+                    // Done at the load event, or once the DOM has been ready for a short grace
+                    // period: slow images, ads and trackers must not hold a navigation for a minute.
+                    committed && (!*t.loading.borrow() || t.dom_ready_at.is_some_and(|d| d.elapsed() >= DOM_READY_GRACE))
+                })
             };
             match done {
                 // The navigation request's id is its loader id.
-                Some(true) => return Ok(self.tab_read(page, |t| t.requests.iter().rev().find(|r| r.id == loader).and_then(|r| r.status)).ok().flatten()),
+                Some(true) => return Ok(self.tab_read(page, |t| t.requests.iter().rev().find(|r| r.id == loader || r.id == t.loader_id).and_then(|r| r.status)).ok().flatten()),
                 None => bail!("tab closed during navigation"),
                 _ => {}
             }
@@ -557,7 +569,7 @@ impl Browser {
                     let new_xhr = t.requests[before.1.min(t.requests.len())..]
                         .iter()
                         .any(|r| !r.finished && matches!(r.resource_type.as_str(), "Fetch" | "XHR" | "Document"));
-                    (t.nav_seq != before.0, *t.loading.borrow(), new_xhr, t.dialog.is_some())
+                    (t.nav_seq != before.0, *t.loading.borrow() && !t.dom_ready_at.is_some_and(|d| d.elapsed() >= DOM_READY_GRACE), new_xhr, t.dialog.is_some())
                 })
             };
             let Some((navigated, loading, busy, dialog)) = snap else { return Ok(out) };
@@ -1061,6 +1073,7 @@ fn on_event(ev: &Event, state: &Arc<Mutex<State>>, cdp: Option<Arc<Cdp>>, rt: &t
                     world_ctx: None,
                     loader_id: String::new(),
                     loading: watch::channel(false).0,
+                    dom_ready_at: None,
                     ready: watch::channel(false).0,
                     console: Vec::new(),
                     console_nav_start: 0,
@@ -1261,6 +1274,9 @@ async fn fulfill_route(cdp: &Cdp, session: &str, request_id: Value, r: &Route, r
 
 fn on_page_event(ev: &Event, tab: &mut Tab) {
     let p = &ev.params;
+    if std::env::var_os("BROWSER_RS_DEBUG").is_some() && ev.method.starts_with("Page.") {
+        eprintln!("[page] {} main={} loader={} {}", ev.method, tab.main_frame, tab.loader_id, p.to_string().chars().take(200).collect::<String>());
+    }
     match ev.method.as_str() {
         "Page.frameNavigated" if p["frame"].get("parentId").is_none() => {
             let f = &p["frame"];
@@ -1279,10 +1295,14 @@ fn on_page_event(ev: &Event, tab: &mut Tab) {
         }
         "Page.frameStartedLoading" if p["frameId"] == tab.main_frame.as_str() || tab.main_frame.is_empty() => {
             tab.nav_seq += 1;
+            tab.dom_ready_at = None;
             tab.loading.send_replace(true);
         }
         "Page.frameStoppedLoading" if p["frameId"] == tab.main_frame.as_str() => {
             tab.loading.send_replace(false);
+        }
+        "Page.lifecycleEvent" if p["frameId"] == tab.main_frame.as_str() && p["name"] == "DOMContentLoaded" => {
+            tab.dom_ready_at = Some(Instant::now());
         }
         "Page.lifecycleEvent" if p["frameId"] == tab.main_frame.as_str() && p["name"] == "load" => {
             tab.loading.send_replace(false);

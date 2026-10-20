@@ -11,7 +11,7 @@ keywords = ["mcp", "browser", "automation", "chromium", "agents"]
 categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
-rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.6.0", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }

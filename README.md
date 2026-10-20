@@ -19,12 +19,13 @@ Website: [browser-rs.lukaloehr.com](https://browser-rs.lukaloehr.com)
 
 ## 1. What it does
 
-- **Playwright MCP's tools, same names and parameters.** 38 by default, 83 with `--caps all`:
+- **Playwright MCP's tools, same names and parameters.** 39 by default, 84 with `--caps all`:
   navigation, snapshots with element refs, trusted clicks, typing, drag and drop, dialogs, uploads,
   tabs, network mocking, cookies and storage, screenshots, PDF, tracing, video, test assertions.
 - **Reading without snapshots.** `browser_text` returns the page as Markdown (the article, one
   section, or just the opening paragraph), `browser_links` lists links as one line each,
-  `browser_table`, `browser_extract` and `browser_read` pull exactly the values you need.
+  `browser_table`, `browser_extract` and `browser_read` pull exactly the values you need, and
+  `browser_frames` reads every frame, nested framesets and cross-origin iframes included.
 - **Fewer round trips.** `browser_batch` runs navigate, type, click, wait and read in one call, and
   a `read` step with `equals` turns into an assertion. Every action can skip its snapshot
   (`snapshot: "none"`); by default a reply shows only the lines that changed.
@@ -88,6 +89,7 @@ browser process group down if the server dies, even by SIGKILL. No orphaned Chro
 | `src/liveview.rs`, `src/liveview.html` | The hand-off viewer: token-protected local server, screencast relay, input forwarding |
 | `src/keys.rs` | Playwright key names to CDP key events |
 | `scripts/bench_browser.py` | The benchmark against `@playwright/mcp` |
+| `scripts/smoke.py` | Smoke tests over MCP against a local test server: `python3 scripts/smoke.py` after a build |
 
 Before every click the page runtime waits until the element is attached, visible, stable, not
 animating, enabled and actually hit at its center; if something covers it, the error names what.
@@ -113,12 +115,12 @@ first, then follow it exactly.
 
 ## 6. Tools
 
-**Default (38):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_find`,
+**Default (39):** `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_find`,
 `browser_click`, `browser_hover`, `browser_type`, `browser_fill_form`, `browser_select_option`,
 `browser_press_key`, `browser_drag`, `browser_drop`, `browser_file_upload`, `browser_handle_dialog`,
 `browser_evaluate`, `browser_wait_for`, `browser_take_screenshot`, `browser_resize`, `browser_tabs`,
 `browser_console_messages`, `browser_network_requests`, `browser_network_request`, `browser_close`,
-`browser_install`, and the agent tools `browser_text`, `browser_links`, `browser_table`,
+`browser_install`, and the agent tools `browser_text`, `browser_frames`, `browser_links`, `browser_table`,
 `browser_extract`, `browser_read`, `browser_fetch`, `browser_scrape`, `browser_batch`,
 `browser_search`, `browser_check`, `browser_scroll_until`, `browser_run_snippet`,
 `browser_handoff`, `browser_set_mode`.
@@ -169,7 +171,8 @@ Environment: `BROWSER_RS_CACHE`, `BROWSER_RS_TRACE`, `BROWSER_RS_NO_VIEWER` (tes
 - `browser_set_mode` relaunches Chromium, so pages reload; use `browser_handoff` when state matters.
 - Not implemented: `browser_run_code_unsafe` (needs Playwright's Node runtime), `browser_annotate`,
   `browser_resume`, and the `--device`, `--mobile`, `--init-page` and `--config` options.
-- Cross-origin iframes are not part of snapshots; same-origin iframes and open shadow roots are.
+- Cross-origin iframes are not part of snapshots and selectors cannot enter them; `browser_frames`
+  reads their text. Same-origin iframes, framesets and open shadow roots are part of snapshots.
 
 ## 9. Benchmarks
 
